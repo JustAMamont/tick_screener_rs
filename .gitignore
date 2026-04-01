@@ -1,0 +1,6 @@
+/logs
+/target
+*.md
+!README.md
+*.py
+*.json

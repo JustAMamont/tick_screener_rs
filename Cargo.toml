@@ -1,0 +1,43 @@
+[package]
+name = "tick-screener"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance multi-exchange market anomaly scanner"
+authors = ["JustAMamont"]
+
+[dependencies]
+tokio = { version = "1", features = ["full", "signal"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = "0.14"
+rayon = "1.10"
+dashmap = "6.1"
+parking_lot = "0.12"
+notify = "8"
+notify-debouncer-mini = "0.5"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+thiserror = "2"
+async-trait = "0.1"
+anyhow = "1"
+crossbeam-channel = "0.5"
+thread_local = "1"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+url = "2"
+chrono = "0.4"
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+prost = "0.14.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,22 @@
+[
+    {
+        "scan": "mexc_fut",
+        "blacklist": [],
+        "currency_type": "perp",
+        "quote": "*USD",   // *USD - All stables or USDT or USDC etc 
+        "alert_settings": {
+            "return_limit": 1,
+            "volume_limit": 2000,
+            "trange": 1,
+            "telegram": {
+                "bot_token": "your_bot_token",
+                "chat_id": -100123456789
+            },
+            "delimiter": ""
+        },
+        "process_settings": {
+            "pairs_batch_size": 1000,
+            "launch_delay": 1.0
+        }
+    }
+]
