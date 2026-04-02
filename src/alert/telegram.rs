@@ -7,6 +7,18 @@ use tracing::{error, info, warn};
 
 const TG_API_BASE: &str = "https://api.telegram.org";
 
+#[derive(serde::Deserialize)]
+struct TgResponse {
+    #[allow(dead_code)]
+    ok: bool,
+    result: Option<TgMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct TgMessage {
+    message_id: i64,
+}
+
 /// Pool of Telegram bots, deduplicated by bot_token.
 #[derive(Clone)]
 pub struct BotPool {
@@ -43,8 +55,8 @@ impl Default for BotPool {
 
 /// Per-chat state: cooldown + buffer.
 struct ChatState {
-    /// Buffered alert messages accumulated during cooldown.
-    buffer: Vec<String>,
+    /// Buffered alert messages accumulated during cooldown. (text, pin_flag)
+    buffer: Vec<(String, bool)>,
     /// When we're allowed to send again (set from 429 retry_after).
     cooldown_until: Instant,
 }
@@ -61,19 +73,21 @@ impl ChatState {
         Instant::now() < self.cooldown_until
     }
 
-    fn buffer_alert(&mut self, text: &str) {
-        self.buffer.push(text.to_string());
+    fn buffer_alert(&mut self, text: &str, pin: bool) {
+        self.buffer.push((text.to_string(), pin));
     }
 
     fn has_buffer(&self) -> bool {
         !self.buffer.is_empty()
     }
 
-    fn take_buffer(&mut self) -> String {
-        let combined = self.buffer.join("\n\n");
+    fn take_buffer(&mut self) -> (String, bool) {
+        let texts: Vec<String> = self.buffer.iter().map(|(t, _)| t.clone()).collect();
+        let combined = texts.join("\n\n");
+        let should_pin = self.buffer.iter().any(|(_, p)| *p);
         self.buffer.clear();
         self.buffer.shrink_to_fit();
-        combined
+        (combined, should_pin)
     }
 }
 
@@ -100,7 +114,7 @@ impl TgBot {
     }
 
     /// Send a message. If 429: buffer during cooldown, flush as one message after.
-    pub async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+    pub async fn send_message(&self, chat_id: i64, text: &str, pin: bool) -> anyhow::Result<()> {
         let state = self.chat_state
             .entry(chat_id)
             .or_insert_with(|| Arc::new(Mutex::new(ChatState::new())))
@@ -112,17 +126,22 @@ impl TgBot {
 
             if s.is_cooling_down() {
                 // Still cooling down — just buffer
-                s.buffer_alert(text);
+                s.buffer_alert(text, pin);
                 return Ok(());
             }
 
             // Try to flush buffer first if anything accumulated
             if s.has_buffer() {
-                let combined = s.take_buffer();
+                let (combined, combined_pin) = s.take_buffer();
                 drop(s);
 
                 match self.send_http(chat_id, &combined).await {
-                    Ok(()) => continue, // Buffer sent, now send the current alert below
+                    Ok(msg_id) => {
+                        if combined_pin {
+                            let _ = self.pin_message(chat_id, msg_id).await;
+                        }
+                        continue; // Buffer sent, now send the current alert below
+                    }
                     Err(e) => {
                         if let Some(secs) = extract_retry_after(&e.to_string()) {
                             let mut s = state.lock().await;
@@ -130,9 +149,9 @@ impl TgBot {
                             s.cooldown_until = cd;
                             // Put combined back into buffer + the current alert
                             for line in combined.splitn(20, "\n\n") {
-                                s.buffer.push(line.to_string());
+                                s.buffer.push((line.to_string(), combined_pin));
                             }
-                            s.buffer_alert(text);
+                            s.buffer_alert(text, pin);
                             warn!("TG 429 flush for chat {}: buffering for {}s", chat_id, secs);
                             self.spawn_flush_timer(chat_id, state.clone(), cd);
                             return Ok(());
@@ -145,13 +164,18 @@ impl TgBot {
             // No buffer — send the current alert immediately
             drop(s);
             match self.send_http(chat_id, text).await {
-                Ok(()) => return Ok(()),
+                Ok(msg_id) => {
+                    if pin {
+                        let _ = self.pin_message(chat_id, msg_id).await;
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     if let Some(secs) = extract_retry_after(&e.to_string()) {
                         let mut s = state.lock().await;
                         let cd = Instant::now() + Duration::from_secs(secs) + Duration::from_millis(500);
                         s.cooldown_until = cd;
-                        s.buffer_alert(text);
+                        s.buffer_alert(text, pin);
                         warn!("TG 429 for chat {}: buffering for {}s", chat_id, secs);
                         self.spawn_flush_timer(chat_id, state.clone(), cd);
                         return Ok(());
@@ -176,7 +200,7 @@ impl TgBot {
             tokio::time::sleep(delay).await;
 
             // Flush buffer if anything accumulated (regardless of cooldown state)
-            let combined = {
+            let (combined, combined_pin) = {
                 let mut s = state.lock().await;
                 if s.has_buffer() {
                     let n = s.buffer.len();
@@ -205,6 +229,24 @@ impl TgBot {
                     info!("TG flush timer: sent batch to chat {}", chat_id);
                     let mut s = state.lock().await;
                     s.cooldown_until = Instant::now();
+
+                    if combined_pin {
+                        if let Ok(body) = r.text().await {
+                            if let Ok(data) = serde_json::from_str::<TgResponse>(&body) {
+                                if let Some(msg) = data.result {
+                                    let pin_url = format!("{}/bot{}/pinChatMessage", TG_API_BASE, token);
+                                    let _ = client.post(&pin_url)
+                                        .json(&serde_json::json!({
+                                            "chat_id": chat_id,
+                                            "message_id": msg.message_id,
+                                            "disable_notification": false,
+                                        }))
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(r) => {
                     let body = r.text().await.unwrap_or_default();
@@ -212,10 +254,7 @@ impl TgBot {
                         warn!("TG flush timer: 429 again for chat {}, retry in {}s", chat_id, secs);
                         let mut s = state.lock().await;
                         s.cooldown_until = Instant::now() + Duration::from_secs(secs) + Duration::from_millis(500);
-                        // Re-arm timer for new cooldown
-                        drop(s);
-                        // We need to re-spawn but we don't have TgBot here
-                        // Instead just reset cooldown — next send_message call will handle it
+                        // We do not re-arm here: the next send_message will hit `has_buffer()` on next incoming alert.
                     }
                     error!("TG flush timer: send failed for chat {}: {}", chat_id, body);
                     let mut s = state.lock().await;
@@ -230,8 +269,8 @@ impl TgBot {
         });
     }
 
-    /// Raw HTTP POST to Telegram API.
-    async fn send_http(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+    /// Raw HTTP POST to Telegram API. Returns the message_id if successful.
+    async fn send_http(&self, chat_id: i64, text: &str) -> anyhow::Result<i64> {
         let url = format!("{}/bot{}/sendMessage", TG_API_BASE, self.token);
         let resp = self.client
             .post(&url)
@@ -244,11 +283,42 @@ impl TgBot {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        
+        if !status.is_success() {
             error!("TG API error {}: {}", status, body);
             anyhow::bail!("TG API error {}: {}", status, body);
+        }
+
+        let data: TgResponse = serde_json::from_str(&body)?;
+        if let Some(msg) = data.result {
+            Ok(msg.message_id)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Pin an already sent message.
+    async fn pin_message(&self, chat_id: i64, message_id: i64) -> anyhow::Result<()> {
+        if message_id == 0 {
+            return Ok(());
+        }
+        let url = format!("{}/bot{}/pinChatMessage", TG_API_BASE, self.token);
+        let resp = self.client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "disable_notification": false,
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            error!("TG API pin error {}: {}", status, body);
         }
         Ok(())
     }

@@ -56,6 +56,7 @@ pub struct Alert {
     pub ts: i64,
     pub message: String,
     pub alert_type: String,
+    pub pin: bool,
 }
 
 // ============================================================================
@@ -237,6 +238,7 @@ impl ScannerCore {
                                         ts: closed.ts,
                                         message: format_alert(&fmt_sym, pct, closed.volume),
                                         alert_type: "volatility".to_string(),
+                                        pin: false,
                                     });
                                 }
                             }

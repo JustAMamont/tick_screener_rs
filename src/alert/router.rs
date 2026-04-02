@@ -50,7 +50,7 @@ impl AlertRouter {
 
             let bot = self.bot_pool.get_or_create(&tg.bot_token);
 
-            if let Err(e) = bot.send_message(tg.chat_id, &alert.message).await {
+            if let Err(e) = bot.send_message(tg.chat_id, &alert.message, alert.pin).await {
                 error!(
                     "Failed to send alert for scanner {} to chat {}: {}",
                     scanner_id, tg.chat_id, e

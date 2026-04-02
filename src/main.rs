@@ -194,7 +194,6 @@ impl App {
 }
 
 async fn run_pairlist_refresher(
-    feed_manager: Arc<FeedManager>,
     alert_tx: mpsc::Sender<(String, Alert)>,
     scanner_configs: Arc<RwLock<Vec<ScannerRuntimeConfig>>>,
     cancel: CancellationToken,
@@ -206,41 +205,61 @@ async fn run_pairlist_refresher(
         tokio::select! {
             _ = interval.tick() => {
                 let configs = scanner_configs.read().await;
-                let mut seen_feeds: HashSet<FeedKey> = HashSet::new();
+                let mut feeds_to_check = HashSet::new();
 
                 for config in configs.iter() {
-                    let key = FeedKey::new(config.exchange, config.market_type);
-                    if seen_feeds.contains(&key) { continue; }
-                    seen_feeds.insert(key.clone());
+                    feeds_to_check.insert(FeedKey::new(config.exchange, config.market_type));
+                }
 
-                    let current = feed_manager.get_pairlist(&key);
+                for key in feeds_to_check {
+                    let factory = tick_screener::exchanges::connector::get_connector_factory(key.exchange);
+                    let connector = factory(key.market_type);
 
-                    if let Some(previous) = historical_pairlists.get(&key) {
-                        let new_pairs: Vec<String> = current.difference(previous).cloned().collect();
-                        for pair in &new_pairs {
-                            info!("⚡️ LISTING detected: {} on {:?}", pair, key);
-                            for scanner_config in configs.iter() {
-                                let sk = FeedKey::new(scanner_config.exchange, scanner_config.market_type);
-                                if sk == key {
-                                    let delimiter = &scanner_config.alert_settings.delimiter;
-                                    let display = pair.replace('/', delimiter);
-                                    let msg = format!(
-                                        "⚡️ ⚡️ ⚡️ LISTING!!! `{}` ⚡️ ⚡️ ⚡️\n{:?} {}",
-                                        display, key.exchange, key.market_type
-                                    );
-                                    let listing_alert = Alert {
-                                        symbol: pair.clone(),
-                                        ts: 0,
-                                        message: msg,
-                                        alert_type: "listing".to_string(),
-                                    };
-                                    let _ = alert_tx.send((scanner_config.scanner_id.clone(), listing_alert)).await;
+                    match connector.load_markets().await {
+                        Ok(markets) => {
+                            let current_symbols: HashSet<String> = markets.into_iter().map(|m| m.symbol).collect();
+                            
+                            if let Some(previous) = historical_pairlists.get(&key) {
+                                let new_pairs: Vec<String> = current_symbols.difference(previous).cloned().collect();
+                                
+                                for pair in new_pairs {
+                                    info!("⚡️ NEW LISTING detected: {} on {:?}", pair, key);
+                                    
+                                    for scanner_config in configs.iter() {
+                                        let sk = FeedKey::new(scanner_config.exchange, scanner_config.market_type);
+                                        if sk == key {
+                                            let quote = pair.split(':').next().and_then(|s| s.split('/').nth(1)).unwrap_or("");
+                                            if !scanner_config.quote_aliases.iter().any(|q| q == quote) {
+                                                continue;
+                                            }
+
+                                            let display = pair.replace('/', &scanner_config.alert_settings.delimiter)
+                                                              .split(':').next().unwrap_or(&pair).to_string();
+                                            
+                                            let msg = format!(
+                                                "⚡️ ⚡️ ⚡️ *NEW LISTING* ⚡️ ⚡️ ⚡️\n\n`{}`\nExchange: *{}*\nMarket: *{}*",
+                                                display, key.exchange, key.market_type
+                                            );
+
+                                            let listing_alert = Alert {
+                                                symbol: pair.clone(),
+                                                ts: chrono::Utc::now().timestamp_millis(),
+                                                message: msg,
+                                                alert_type: "listing".to_string(),
+                                                pin: true,
+                                            };
+                                            let _ = alert_tx.send((scanner_config.scanner_id.clone(), listing_alert)).await;
+                                        }
+                                    }
                                 }
                             }
+                            
+                            historical_pairlists.insert(key, current_symbols);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Refresher: failed to load markets for {:?}: {}", key, e);
                         }
                     }
-
-                    historical_pairlists.insert(key.clone(), current);
                 }
                 drop(configs);
             }
@@ -357,16 +376,11 @@ async fn main() {
         let a = app.lock().await;
         a.cancel.clone()
     };
-    let refresh_feed_manager = {
-        let a = app.lock().await;
-        Arc::clone(&a.feed_manager)
-    };
     let refresh_configs = {
         let a = app.lock().await;
         Arc::clone(&a.scanner_configs)
     };
     let refresh_handle = tokio::spawn(run_pairlist_refresher(
-        refresh_feed_manager,
         alert_tx.clone(),
         refresh_configs,
         refresh_cancel,
