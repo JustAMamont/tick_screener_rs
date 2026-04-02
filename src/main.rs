@@ -196,6 +196,7 @@ impl App {
 async fn run_pairlist_refresher(
     alert_tx: mpsc::Sender<(String, Alert)>,
     scanner_configs: Arc<RwLock<Vec<ScannerRuntimeConfig>>>,
+    feed_manager: Arc<FeedManager>,
     cancel: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(120));
@@ -262,6 +263,31 @@ async fn run_pairlist_refresher(
                     }
                 }
                 drop(configs);
+
+                // Check for dead feeds (empty pairlists)
+                for (feed_key, config) in feed_manager.feeds_needing_repair() {
+                    warn!(
+                        "Dead feed detected: {:?} has empty pairlist, triggering repair",
+                        feed_key
+                    );
+                    let factory = tick_screener::exchanges::connector::get_connector_factory(feed_key.exchange);
+                    let connector = factory(feed_key.market_type);
+                    match connector.load_markets().await {
+                        Ok(markets) => {
+                            let symbols: HashSet<String> = markets.into_iter()
+                                .filter(|m| config.quote_aliases.contains(&m.quote) && !config.blacklist.contains(&m.symbol))
+                                .map(|m| m.symbol)
+                                .collect();
+                            if !symbols.is_empty() {
+                                info!("Dead feed {:?} repaired with {} symbols", feed_key, symbols.len());
+                                feed_manager.unsubscribe(&feed_key, "__repair__");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Dead feed {:?} repair failed: {}", feed_key, e);
+                        }
+                    }
+                }
             }
             _ = cancel.cancelled() => break,
         }
@@ -380,9 +406,14 @@ async fn main() {
         let a = app.lock().await;
         Arc::clone(&a.scanner_configs)
     };
+    let refresh_feed_manager = {
+        let a = app.lock().await;
+        Arc::clone(&a.feed_manager)
+    };
     let refresh_handle = tokio::spawn(run_pairlist_refresher(
         alert_tx.clone(),
         refresh_configs,
+        refresh_feed_manager,
         refresh_cancel,
     ));
 

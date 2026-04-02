@@ -17,6 +17,7 @@ pub struct NormalizedTrade {
 /// Supported exchanges
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum Exchange {
+    Binance,
     Bybit,
     Kucoin,
     Bitget,
@@ -28,8 +29,10 @@ impl Exchange {
     /// Parse exchange name from scan config key (e.g., "bybit_spot" -> Bybit)
     pub fn from_scan_name(name: &str) -> Option<Self> {
         let lower = name.to_lowercase();
-        if lower.starts_with("bybit") {
-            Some(Exchange::Bybit)
+        if lower.starts_with("binance") {
+            Some(Exchange::Binance)
+        } else if lower.starts_with("bybit") {
+            Some(Exchange::Binance)
         } else if lower.starts_with("kucoin") {
             Some(Exchange::Kucoin)
         } else if lower.starts_with("bitget") {
@@ -45,6 +48,7 @@ impl Exchange {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Exchange::Binance => "binance",
             Exchange::Bybit => "bybit",
             Exchange::Kucoin => "kucoin",
             Exchange::Bitget => "bitget",

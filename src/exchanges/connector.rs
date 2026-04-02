@@ -43,6 +43,7 @@ pub trait ExchangeConnector: Send + Sync {
 /// Get a connector factory for a given exchange
 pub fn get_connector_factory(exchange: Exchange) -> ConnectorFactory {
     match exchange {
+        Exchange::Binance => |mt| Box::new(crate::exchanges::binance::BinanceConnector::new(mt)),
         Exchange::Bybit => |mt| Box::new(crate::exchanges::bybit::BybitConnector::new(mt)),
         Exchange::Kucoin => |mt| Box::new(crate::exchanges::kucoin::KucoinConnector::new(mt)),
         Exchange::Bitget => |mt| Box::new(crate::exchanges::bitget::BitgetConnector::new(mt)),

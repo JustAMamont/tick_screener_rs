@@ -155,7 +155,7 @@ impl ExchangeConnector for MexcConnector {
     fn max_subscribe_args(&self) -> usize {
         match self.market_type {
             MarketType::Spot => 30,
-            MarketType::Perp => 30, // ИСПРАВЛЕНИЕ: Ставим лимит для фьючерсов (было 0 = неограниченно)
+            MarketType::Perp => 30,
         }
     }
 }
@@ -202,7 +202,8 @@ impl MexcConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => return Ok(()),
                     }
-                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    retry_delay = ((retry_delay * 2) + jitter).min(std::time::Duration::from_secs(30));
                 }
             }
         }
@@ -285,7 +286,8 @@ impl MexcConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    retry_delay = ((retry_delay * 2) + jitter).min(std::time::Duration::from_secs(30));
                 }
             }
         }
@@ -302,7 +304,6 @@ impl MexcConnector {
         for symbol in symbols {
             let msg = serde_json::json!({ "method": "sub.deal", "param": { "symbol": symbol } });
             write.send(Message::Text(msg.to_string().into())).await?;
-            // ИСПРАВЛЕНИЕ: Крошечная задержка, чтобы MEXC не посчитал отправку Flood-атакой и не обрывал коннект
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
         info!("MEXC perp WS subscribed to {} symbols", symbols.len());
@@ -313,7 +314,6 @@ impl MexcConnector {
         loop {
             tokio::select! {
                 _ = ping_interval.tick() => {
-                    // ИСПРАВЛЕНИЕ: Пинг на фьючах MEXC должен быть валидным JSON-объектом
                     if write.send(Message::Text(r#"{"method":"ping"}"#.into())).await.is_err() {
                         anyhow::bail!("Failed to send MEXC perp ping");
                     }
@@ -321,7 +321,6 @@ impl MexcConnector {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            // ИСПРАВЛЕНИЕ: Ответ на пинг это JSON `{"channel":"pong"}`
                             if text.contains("pong") { continue; }
                             if let Some(trades) = Self::parse_perp_trade(&text) {
                                 for trade in trades { let _ = tx.send(trade); }
@@ -342,7 +341,6 @@ impl MexcConnector {
         }
     }
 
-    /// Parse MEXC spot protobuf
     fn parse_spot_pb(data: &[u8]) -> Option<Vec<NormalizedTrade>> {
         if data.first() == Some(&b'{') { return None; }
 
@@ -370,7 +368,6 @@ impl MexcConnector {
         if trades.is_empty() { None } else { Some(trades) }
     }
 
-    /// Parse MEXC perp trade (JSON).
     fn parse_perp_trade(text: &str) -> Option<Vec<NormalizedTrade>> {
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
         let channel = v.get("channel")?.as_str()?;

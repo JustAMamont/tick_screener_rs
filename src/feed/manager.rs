@@ -1,4 +1,3 @@
-use crate::config::model::{FeedKey, ScannerRuntimeConfig};
 use crate::exchanges::connector::{get_connector_factory, ExchangeConnector};
 use crate::exchanges::normalized::NormalizedTrade;
 use crate::interner::SymbolInterner;
@@ -7,7 +6,9 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use crate::config::model::{FeedKey, ScannerRuntimeConfig};
 
 /// A shared exchange feed — one per (exchange, market_type) pair.
 struct SharedFeed {
@@ -21,6 +22,7 @@ struct SharedFeed {
     tx: tokio::sync::broadcast::Sender<NormalizedTrade>,
     /// The tokio JoinHandle for the WS streaming task
     _handle: tokio::task::JoinHandle<()>,
+    config: ScannerRuntimeConfig,
 }
 
 /// Manages shared exchange feeds.
@@ -38,6 +40,13 @@ impl FeedManager {
             interner,
             pairlists: DashMap::new(),
         }
+    }
+
+    pub fn feeds_needing_repair(&self) -> Vec<(FeedKey, ScannerRuntimeConfig)> {
+        self.feeds.iter()
+            .filter(|entry| self.pairlists.get(entry.key()).map(|p| p.is_empty()).unwrap_or(true))
+            .map(|entry| (entry.key().clone(), entry.value().config.clone()))
+            .collect()
     }
 
     /// Subscribe a scanner to a feed. Creates the feed if it doesn't exist.
@@ -104,52 +113,22 @@ impl FeedManager {
                 let batch_cancel = cancel_clone.clone();
                 let cumulative_delay = batch_index as f64 * launch_delay;
                 let current_batch_index = batch_index;
-                let current_batch_start = batch_start;
+                let _current_batch_start = batch_start;
 
                 // Spawn WS task for this batch
                 tokio::spawn(async move {
-                    // Cumulative delay: batch 0 = 0s, batch 1 = 1s, batch 2 = 2s, etc.
                     if cumulative_delay > 0.0 {
-                        info!(
-                            "Feed {:?} batch #{} ({}-{}): waiting {:.1}s before connect",
-                            key_clone, current_batch_index, current_batch_start, end, cumulative_delay
-                        );
                         tokio::select! {
                             _ = tokio::time::sleep(std::time::Duration::from_secs_f64(cumulative_delay)) => {},
                             _ = batch_cancel.cancelled() => return,
                         }
                     }
-
-                    // Exponential backoff retry loop
-                    let mut retry_delay = std::time::Duration::from_secs(1);
-                    let max_retry_delay = std::time::Duration::from_secs(30);
-
-                    loop {
-                        if batch_cancel.is_cancelled() {
-                            break;
-                        }
-
-                        let connector = factory_fn(key_clone.market_type);
-
-                        match connector
-                            .stream_trades(batch.clone(), batch_tx.clone(), batch_cancel.clone())
-                            .await
-                        {
-                            Ok(()) => break,
-                            Err(e) => {
-                                if batch_cancel.is_cancelled() {
-                                    break;
-                                }
-                                warn!(
-                                    "Feed {:?} batch #{} error: {} (retry in {:?})",
-                                    key_clone, current_batch_index, e, retry_delay
-                                );
-                                tokio::select! {
-                                    _ = tokio::time::sleep(retry_delay) => {},
-                                    _ = batch_cancel.cancelled() => break,
-                                }
-                                retry_delay = (retry_delay * 2).min(max_retry_delay);
-                            }
+                    if let Err(e) = factory_fn(key_clone.market_type)
+                        .stream_trades(batch, batch_tx, batch_cancel.clone())
+                        .await
+                    {
+                        if !batch_cancel.is_cancelled() {
+                            warn!("Feed {:?} batch #{} error: {}", key_clone, current_batch_index, e);
                         }
                     }
                 });
@@ -171,6 +150,7 @@ impl FeedManager {
             }),
             tx,
             _handle: handle,
+            config: config.clone(),
         });
 
         self.feeds.insert(key.clone(), feed.clone());
@@ -243,27 +223,18 @@ impl FeedManager {
         config: &ScannerRuntimeConfig,
     ) -> Vec<String> {
         let mut retry_delay = std::time::Duration::from_secs(2);
-        let max_retry = 5;
-        let mut attempt = 0;
-
+        let max_delay = std::time::Duration::from_secs(60);
         let markets = loop {
-            attempt += 1;
             match connector.load_markets().await {
                 Ok(m) => break m,
                 Err(e) => {
-                    if attempt >= max_retry {
-                        error!(
-                            "Failed to load markets for {:?} after {} attempts: {}",
-                            connector.exchange(), attempt, e
-                        );
-                        break Vec::new();
-                    }
                     warn!(
-                        "Failed to load markets for {:?} (attempt {}): {}. Retrying in {:?}",
-                        connector.exchange(), attempt, e, retry_delay
+                        "load_symbols for {:?} {:?} failed: {}. Retrying in {:?}",
+                        connector.exchange(), connector.market_type(), e, retry_delay
                     );
                     tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    retry_delay = (retry_delay * 2 + jitter).min(max_delay);
                 }
             }
         };

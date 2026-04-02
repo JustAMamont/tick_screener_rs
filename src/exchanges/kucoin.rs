@@ -309,7 +309,8 @@ impl ExchangeConnector for KucoinConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    retry_delay = (retry_delay * 2).min(max_retry_delay);
+                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                     // Re-fetch token for next retry
                     if let Ok((new_url, new_token)) = self.get_ws_token_rate_limited(is_futures).await {
                         full_url = format!("{}?token={}", new_url, new_token);
@@ -507,6 +508,3 @@ impl KucoinConnector {
         }])
     }
 }
-
-
-// both 75

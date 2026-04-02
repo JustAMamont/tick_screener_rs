@@ -179,7 +179,8 @@ impl ExchangeConnector for GateConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    retry_delay = (retry_delay * 2).min(max_retry_delay);
+                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                 }
             }
         }
@@ -338,6 +339,3 @@ impl GateConnector {
         }
     }
 }
-
-
-//both unlim
