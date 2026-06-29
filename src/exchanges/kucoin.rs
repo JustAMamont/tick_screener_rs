@@ -4,17 +4,17 @@ use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::Message;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-// Static symbol maps: populated during load_markets(), used by stream_trades and parser
-// raw_symbol (e.g. "BTC-USDT", "XBTUSDTM") -> unified symbol (e.g. "BTC/USDT", "BTC/USDT:USDT")
+// У Kucoin разные форматы символов для spot (например "BTC-USDT") и perp (например "XBTUSDTM"),
+// поэтому используем два отдельных кэша для spot и perp, чтобы они не перезаписывали друг друга.
 static RAW_TO_UNIFIED: LazyLock<parking_lot::RwLock<HashMap<String, String>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
-// unified symbol -> raw_symbol (for WS subscriptions)
+// unified symbol -> raw_symbol (для WS-подписок)
 static UNIFIED_TO_RAW: LazyLock<parking_lot::RwLock<HashMap<String, String>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
@@ -50,20 +50,29 @@ impl KucoinConnector {
         };
 
         let resp_text = self.client.post(&url).send().await?.text().await?;
-        let resp: KucoinBulletResponse = serde_json::from_str(&resp_text)
-            .map_err(|e| anyhow::anyhow!("Failed to parse bullet-public response ({}): {}", e, &resp_text[..resp_text.len().min(300)]))?;
+        let resp: KucoinBulletResponse = serde_json::from_str(&resp_text).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse bullet-public response ({}): {}",
+                e,
+                &resp_text[..resp_text.len().min(300)]
+            )
+        })?;
         let data = resp.data;
         Ok((data.instance_servers[0].endpoint.clone(), data.token))
     }
 
-    /// Get WS token with rate-limit protection (max 1 request per 2 seconds).
-    /// Returns cached token if recently fetched.
+    /// Получение WS-токена с защитой от превышения лимита запросов (макс. 1 запрос каждые 2 секунды). 
+    /// Возвращает кэшированный токен, если он был получен недавно. 
     ///
-    /// FIX: Separate caches for spot/futures so they don't overwrite each other.
-    ///      Uses parking_lot::Mutex (sync, no .await) so lock is never held across await points.
-    ///      Lock is released BEFORE sleeping so other tasks aren't blocked.
-    async fn get_ws_token_rate_limited(&self, is_futures: bool) -> anyhow::Result<(String, String)> {
-        // Separate caches — spot and futures tokens are independent
+    /// FIX: Раздельные кэши для спота и фьючерсов, чтобы они не перезаписывали друг друга. 
+    /// Используется parking_lot::Mutex (синхронный, без .await), поэтому блокировка не удерживается в точках ожидания (await points). 
+    /// Блокировка снимается ПЕРЕД приостановкой выполнения (sleep), чтобы не блокировать другие задачи.
+    async fn get_ws_token_rate_limited(
+        &self,
+        is_futures: bool,
+    ) -> anyhow::Result<(String, String)> {
+        // Раздельные кэши - тикеры спотового и фьючерсного рынков, они разного формата,
+        // как уже упоминалось выше.
         static SPOT_CACHE: parking_lot::Mutex<Option<(String, String, Instant)>> =
             parking_lot::Mutex::new(None);
         static FUT_CACHE: parking_lot::Mutex<Option<(String, String, Instant)>> =
@@ -72,19 +81,19 @@ impl KucoinConnector {
         let cache: &parking_lot::Mutex<Option<(String, String, Instant)>> =
             if is_futures { &FUT_CACHE } else { &SPOT_CACHE };
 
-        // 1. Check cache (fast, parking_lot = no .await needed)
+        // 1. Проверка кэша (быстро, parking_lot - await не требуется)
         {
             let guard = cache.lock();
-            if let Some((url, token, fetched_at)) = guard.as_ref() {
-                if fetched_at.elapsed() < std::time::Duration::from_secs(25) {
-                    return Ok((url.clone(), token.clone()));
-                }
+            if let Some((url, token, fetched_at)) = guard.as_ref()
+                && fetched_at.elapsed() < std::time::Duration::from_secs(25)
+            {
+                return Ok((url.clone(), token.clone()));
             }
         }
 
-        // 2. Rate limit: compute sleep duration, RELEASE lock, then sleep
-        //    This is critical — the old code held a tokio::Mutex while sleeping,
-        //    which blocked ALL other tasks waiting for a token.
+        // 2. Ограничение частоты (rate limit): вычислить длительность паузы, ОСВОБОДИТЬ блокировку, затем приостановить выполнение
+        // Это критически важно: старый код удерживал tokio::Mutex во время паузы,
+        // что блокировало ВСЕ остальные задачи, ожидающие получения токена.
         {
             let sleep_dur = {
                 let guard = cache.lock();
@@ -98,17 +107,17 @@ impl KucoinConnector {
                 } else {
                     std::time::Duration::ZERO
                 }
-            }; // guard dropped here — other tasks can now read/write cache
+            }; // Снимаю блокировку - теперь другие задачи могут читать из кэша или записывать в него.
 
             if !sleep_dur.is_zero() {
                 tokio::time::sleep(sleep_dur).await;
             }
         }
 
-        // 3. Fetch new token from Kucoin API
+        // 3. Получить новый токен из API KuCoin
         let result = self.get_ws_token(is_futures).await?;
 
-        // 4. Update cache
+        // 4. Обновляем кэш
         {
             let mut guard = cache.lock();
             *guard = Some((result.0.clone(), result.1.clone(), Instant::now()));
@@ -117,23 +126,23 @@ impl KucoinConnector {
         Ok(result)
     }
 
-    /// Fallback parser for spot symbols like "BTC-USDT" -> ("BTC", "USDT")
+    /// Резервный парсер для спотовых символов, таких как «BTC-USDT» -> («BTC», «USDT»)
     #[allow(dead_code)]
     fn parse_kucoin_symbol(raw: &str) -> Option<(String, String)> {
         let quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH", "FDUSD"];
         for q in quotes {
-            if let Some(base) = raw.strip_suffix(&format!("-{}", q)) {
-                if !base.is_empty() {
-                    return Some((base.to_string(), q.to_string()));
-                }
+            if let Some(base) = raw.strip_suffix(&format!("-{}", q))
+                && !base.is_empty()
+            {
+                return Some((base.to_string(), q.to_string()));
             }
         }
-        // Try without dash: BTCUSDT
+        // Пробуем без дефиса: BTCUSDT
         for q in quotes {
-            if let Some(base) = raw.strip_suffix(q) {
-                if !base.is_empty() {
-                    return Some((base.to_string(), q.to_string()));
-                }
+            if let Some(base) = raw.strip_suffix(q)
+                && !base.is_empty()
+            {
+                return Some((base.to_string(), q.to_string()));
             }
         }
         None
@@ -196,10 +205,7 @@ impl ExchangeConnector for KucoinConnector {
 
     async fn load_markets(&self) -> anyhow::Result<Vec<MarketInfo>> {
         let (url, _expected_type) = match self.market_type {
-            MarketType::Spot => (
-                format!("{}/api/v1/symbols", self.rest_base),
-                "TRADE",
-            ),
+            MarketType::Spot => (format!("{}/api/v1/symbols", self.rest_base), "TRADE"),
             MarketType::Perp => (
                 "https://api-futures.kucoin.com/api/v1/contracts/active".to_string(),
                 "FUTURES",
@@ -210,50 +216,60 @@ impl ExchangeConnector for KucoinConnector {
         let markets: Vec<MarketInfo> = match self.market_type {
             MarketType::Spot => {
                 let resp: KucoinMarketsResponse = serde_json::from_str(&resp_text)?;
-                let spot_markets: Vec<KucoinSpotMarket> = resp.data.into_iter()
+                let spot_markets: Vec<KucoinSpotMarket> = resp
+                    .data
+                    .into_iter()
                     .filter_map(|v| serde_json::from_value(v).ok())
                     .collect();
-                spot_markets.into_iter().filter_map(|m| {
-                    if !m.enable_trading {
-                        return None;
-                    }
-                    let (base, quote) = KucoinConnector::parse_kucoin_symbol(&m.symbol)?;
-                    let unified = format!("{}/{}", base, quote);
-                    Some(MarketInfo {
-                        symbol: unified.clone(),
-                        base,
-                        quote,
-                        active: true,
-                        market_type: self.market_type,
-                        raw_symbol: m.symbol,
+                spot_markets
+                    .into_iter()
+                    .filter_map(|m| {
+                        if !m.enable_trading {
+                            return None;
+                        }
+                        let (base, quote) = KucoinConnector::parse_kucoin_symbol(&m.symbol)?;
+                        let unified = format!("{}/{}", base, quote);
+                        Some(MarketInfo {
+                            symbol: unified.clone(),
+                            base,
+                            quote,
+                            active: true,
+                            market_type: self.market_type,
+                            raw_symbol: m.symbol,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             MarketType::Perp => {
                 let resp: KucoinMarketsResponse = serde_json::from_str(&resp_text)?;
-                let futures_markets: Vec<KucoinFuturesMarket> = resp.data.into_iter()
+                let futures_markets: Vec<KucoinFuturesMarket> = resp
+                    .data
+                    .into_iter()
                     .filter_map(|v| serde_json::from_value(v).ok())
                     .collect();
-                futures_markets.into_iter().filter_map(|m| {
-                    if m.status != "Open" {
-                        return None;
-                    }
-                    let base = m.base_currency;
-                    let quote = m.quote_currency;
-                    let unified = format!("{}/{}:{}", base, quote, quote);
-                    Some(MarketInfo {
-                        symbol: unified.clone(),
-                        base,
-                        quote,
-                        active: true,
-                        market_type: self.market_type,
-                        raw_symbol: m.symbol,
+                futures_markets
+                    .into_iter()
+                    .filter_map(|m| {
+                        if m.status != "Open" {
+                            return None;
+                        }
+                        let base = m.base_currency;
+                        let quote = m.quote_currency;
+                        let unified = format!("{}/{}.P", base, quote);
+                        Some(MarketInfo {
+                            symbol: unified.clone(),
+                            base,
+                            quote,
+                            active: true,
+                            market_type: self.market_type,
+                            raw_symbol: m.symbol,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
         };
 
-        // Populate symbol maps for WS subscriptions and trade parsing
+        // Заполнить таблицы соответствия символов для подписок WS и разбора данных о трейдах.
         {
             let mut r2u = RAW_TO_UNIFIED.write();
             let mut u2r = UNIFIED_TO_RAW.write();
@@ -263,7 +279,11 @@ impl ExchangeConnector for KucoinConnector {
             }
         }
 
-        info!("Kucoin {} loaded {} markets", self.market_type, markets.len());
+        info!(
+            "Kucoin {} loaded {} markets",
+            self.market_type,
+            markets.len()
+        );
         Ok(markets)
     }
 
@@ -277,16 +297,18 @@ impl ExchangeConnector for KucoinConnector {
         let (ws_url, ws_token) = self.get_ws_token_rate_limited(is_futures).await?;
         let mut full_url = format!("{}?token={}", ws_url, ws_token);
 
-        // Look up native Kucoin symbols from unified symbols via the map
+        // Ищем тикеры Kuсoin, соответствующие унифицированным тикерам, с помощью таблицы соответствия.
         let kucoin_symbols: Vec<String> = {
             let u2r = UNIFIED_TO_RAW.read();
-            symbols.iter()
-                .filter_map(|s| u2r.get(s).cloned())
-                .collect()
+            symbols.iter().filter_map(|s| u2r.get(s).cloned()).collect()
         };
 
         if kucoin_symbols.is_empty() {
-            warn!("Kucoin {}: no native symbols found for {} unified symbols", self.market_type, symbols.len());
+            warn!(
+                "Kucoin {}: no native symbols found for {} unified symbols",
+                self.market_type,
+                symbols.len()
+            );
             return Ok(());
         }
 
@@ -298,7 +320,10 @@ impl ExchangeConnector for KucoinConnector {
                 break Ok(());
             }
 
-            match self.connect_and_stream(&full_url, &kucoin_symbols, &tx, &cancel).await {
+            match self
+                .connect_and_stream(&full_url, &kucoin_symbols, &tx, &cancel)
+                .await
+            {
                 Ok(()) => break Ok(()),
                 Err(e) => {
                     if cancel.is_cancelled() {
@@ -309,10 +334,13 @@ impl ExchangeConnector for KucoinConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    let jitter =
+                        std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
                     retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
-                    // Re-fetch token for next retry
-                    if let Ok((new_url, new_token)) = self.get_ws_token_rate_limited(is_futures).await {
+                    // Обновляем токен для следующей попытки
+                    if let Ok((new_url, new_token)) =
+                        self.get_ws_token_rate_limited(is_futures).await
+                    {
                         full_url = format!("{}?token={}", new_url, new_token);
                     }
                 }
@@ -321,13 +349,13 @@ impl ExchangeConnector for KucoinConnector {
     }
 
     fn to_native_symbol(&self, unified: &str) -> String {
-        // Use map first, fallback to heuristic
+        // Сначала используем карту, при отсутствии - эвристический разбор
         let u2r = UNIFIED_TO_RAW.read();
         if let Some(raw) = u2r.get(unified) {
             return raw.clone();
         }
         drop(u2r);
-        let without_settle = unified.split(':').next().unwrap_or(unified);
+        let without_settle = unified.strip_suffix(".P").unwrap_or(unified);
         if let Some((base, quote)) = without_settle.split_once('/') {
             format!("{}-{}", base, quote)
         } else {
@@ -336,20 +364,19 @@ impl ExchangeConnector for KucoinConnector {
     }
 
     fn to_unified_symbol(&self, native: &str) -> Option<String> {
-        // Use map first, fallback to heuristic
+        // Сначала используем карту, при отсутствии - эвристический разбор
         let r2u = RAW_TO_UNIFIED.read();
         if let Some(unified) = r2u.get(native) {
             return Some(unified.clone());
         }
         drop(r2u);
         let (base, quote) = KucoinConnector::parse_kucoin_symbol(native)?;
-        let unified = format!("{}/{}", base, quote);
-        let unified = if self.market_type == MarketType::Perp {
-            format!("{}:{}", unified, quote)
+        let suffix = if self.market_type == MarketType::Perp {
+            ".P"
         } else {
-            unified
+            ""
         };
-        Some(unified)
+        Some(format!("{}/{}{}", base, quote, suffix))
     }
 
     fn max_subscribe_args(&self) -> usize {
@@ -365,12 +392,13 @@ impl KucoinConnector {
         tx: &tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(ws_url, None, true).await?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(ws_url, None, true).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        // Kucoin: send individual subscribe message per symbol
-        // Spot:  /market/match:BTC-USDT
-        // Perp:  /contractMarket/execution:XBTUSDTM
+        // Kucoin: отправка индивидуального сообщения о подписке для каждого символа 
+        // Spot: /market/match:BTC-USDT 
+        // Perp: /contractMarket/execution:XBTUSDTM
         let topic_prefix = if self.market_type == MarketType::Perp {
             "/contractMarket/execution:"
         } else {
@@ -413,7 +441,7 @@ impl KucoinConnector {
                             if let Some(trades) = Self::parse_trade_message(&text) {
                                 for trade in trades {
                                     if tx.send(trade).is_err() {
-                                        // No receivers
+                    // Нет получателей
                                     }
                                 }
                             }
@@ -448,7 +476,7 @@ impl KucoinConnector {
     fn parse_trade_message(text: &str) -> Option<Vec<NormalizedTrade>> {
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
-        // Skip non-trade messages (welcome, ack, etc)
+        // Скип не нужных сообщений (welcome, ack, etc)
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if msg_type != "message" {
             return None;
@@ -457,7 +485,8 @@ impl KucoinConnector {
         let topic = v.get("topic")?.as_str()?;
         // Spot:  /market/match:BTC-USDT
         // Perp:  /contractMarket/execution:XBTUSDTM
-        if !topic.starts_with("/market/match:") && !topic.starts_with("/contractMarket/execution:") {
+        if !topic.starts_with("/market/match:") && !topic.starts_with("/contractMarket/execution:")
+        {
             return None;
         }
 
@@ -465,7 +494,7 @@ impl KucoinConnector {
         let symbol = data.get("symbol")?.as_str()?.to_string();
         let is_futures = topic.starts_with("/contractMarket/execution:");
 
-        // Look up unified symbol from raw exchange symbol via the map
+        // Находим унифицированный символ по исходному символу биржи с помощью таблицы соответствия
         let unified = {
             let map = RAW_TO_UNIFIED.read();
             map.get(&symbol).cloned()
@@ -478,24 +507,33 @@ impl KucoinConnector {
             format!("{}/{}", base, quote)
         };
 
-        // Spot:  price/size are strings. Perp: price is string, size is integer (contracts)
-        let price: f64 = data.get("price").and_then(|p| p.as_str()?.parse().ok())
+        // Спот: цена и объем - строковые значения. Бессрочные фьючерсы: цена - строка, объем - целое число (контракты).
+        let price: f64 = data
+            .get("price")
+            .and_then(|p| p.as_str()?.parse().ok())
             .or_else(|| data.get("price").and_then(|p| p.as_f64()))?;
         let size: f64 = if is_futures {
-            // Futures: size is integer (number of contracts)
-            data.get("size").and_then(|s| s.as_i64()).map(|s| s as f64)?
+            // Фьючерсы: размер - целое число (количество контрактов)
+            data.get("size")
+                .and_then(|s| s.as_i64())
+                .map(|s| s as f64)?
         } else {
-            // Spot: size is string
+            // Spot: размер - строка
             data.get("size").and_then(|s| s.as_str()?.parse().ok())?
         };
 
-        // Spot:  data.time = nanosecond string "1774993913317000000"
-        // Perp:  data.ts   = nanosecond integer (e.g. 1731898619520000000)
+        // Spot:  data.time = наносекундная строка "1774993913317000000"
+        // Perp:  data.ts   = наносекундное целое (например 1731898619520000000)
         let timestamp: i64 = if is_futures {
-            data.get("ts").and_then(|t| t.as_i64()).map(|ns| ns / 1_000_000)?
+            data.get("ts")
+                .and_then(|t| t.as_i64())
+                .map(|ns| ns / 1_000_000)?
         } else {
             data.get("time")
-                .and_then(|t| t.as_str().and_then(|s| s.parse::<i64>().ok().map(|ns| ns / 1_000_000)))
+                .and_then(|t| {
+                    t.as_str()
+                        .and_then(|s| s.parse::<i64>().ok().map(|ns| ns / 1_000_000))
+                })
                 .or_else(|| data.get("time").and_then(|t| t.as_i64()))?
         };
 

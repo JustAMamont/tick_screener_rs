@@ -4,8 +4,8 @@ use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::Message;
 use std::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 pub struct BybitConnector {
@@ -44,14 +44,13 @@ impl BybitConnector {
     }
 
     fn parse_bybit_symbol(raw: &str) -> Option<(String, String)> {
-        // Bybit uses BTCUSDT format
-        // Try common quote currencies
+        // Bybit использует формат тикеров без разделителей - например BTCUSDT, ETHUSDT, LTCUSDT.
         let quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH", "FDUSD"];
         for q in quotes {
-            if let Some(base) = raw.strip_suffix(q) {
-                if !base.is_empty() {
-                    return Some((base.to_string(), q.to_string()));
-                }
+            if let Some(base) = raw.strip_suffix(q)
+                && !base.is_empty()
+            {
+                return Some((base.to_string(), q.to_string()));
             }
         }
         None
@@ -108,7 +107,10 @@ impl ExchangeConnector for BybitConnector {
             Ok(r) => r,
             Err(e) => {
                 error!("Bybit API response parse error: {}", e);
-                error!("Raw response (first 500 chars): {}", &resp_text[..resp_text.len().min(500)]);
+                error!(
+                    "Raw response (first 500 chars): {}",
+                    &resp_text[..resp_text.len().min(500)]
+                );
                 anyhow::bail!("Failed to parse Bybit response: {}", e);
             }
         };
@@ -122,11 +124,10 @@ impl ExchangeConnector for BybitConnector {
                     return None;
                 }
                 let (base, quote) = BybitConnector::parse_bybit_symbol(&m.symbol)?;
-                let unified = format!("{}/{}", base, quote);
                 let unified = if self.market_type == MarketType::Perp {
-                    format!("{}:{}", unified, quote)
+                    format!("{}/{}.P", base, quote)
                 } else {
-                    unified
+                    format!("{}/{}", base, quote)
                 };
 
                 Some(MarketInfo {
@@ -140,7 +141,11 @@ impl ExchangeConnector for BybitConnector {
             })
             .collect();
 
-        info!("Bybit {} loaded {} markets", self.market_type, markets.len());
+        info!(
+            "Bybit {} loaded {} markets",
+            self.market_type,
+            markets.len()
+        );
         Ok(markets)
     }
 
@@ -153,7 +158,7 @@ impl ExchangeConnector for BybitConnector {
         let bybit_symbols: Vec<String> = symbols
             .iter()
             .filter_map(|s| {
-                let without_settle = s.split(':').next()?;
+                let without_settle = s.strip_suffix(".P").unwrap_or(s);
                 let (base, quote) = without_settle.split_once('/')?;
                 Some(BybitConnector::format_bybit_symbol(base, quote))
             })
@@ -183,7 +188,8 @@ impl ExchangeConnector for BybitConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    let jitter =
+                        std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
                     retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                 }
             }
@@ -191,7 +197,7 @@ impl ExchangeConnector for BybitConnector {
     }
 
     fn to_native_symbol(&self, unified: &str) -> String {
-        let without_settle = unified.split(':').next().unwrap_or(unified);
+        let without_settle = unified.strip_suffix(".P").unwrap_or(unified);
         if let Some((base, quote)) = without_settle.split_once('/') {
             BybitConnector::format_bybit_symbol(base, quote)
         } else {
@@ -201,18 +207,17 @@ impl ExchangeConnector for BybitConnector {
 
     fn to_unified_symbol(&self, native: &str) -> Option<String> {
         let (base, quote) = BybitConnector::parse_bybit_symbol(native)?;
-        let unified = format!("{}/{}", base, quote);
-        let unified = if self.market_type == MarketType::Perp {
-            format!("{}:{}", unified, quote)
+        let suffix = if self.market_type == MarketType::Perp {
+            ".P"
         } else {
-            unified
+            ""
         };
-        Some(unified)
+        Some(format!("{}/{}{}", base, quote, suffix))
     }
 
     fn max_subscribe_args(&self) -> usize {
-        // Spot: max 10 args per subscribe message (docs)
-        // Linear/Inverse (Perp): no limit
+        // Spot: максимум 10 аргументов в одном SUBSCRIBE сообщении (Bybit API ограничение)
+        // Linear/Inverse (Perp): безлимит
         match self.market_type {
             MarketType::Spot => 10,
             MarketType::Perp => 0,
@@ -221,7 +226,9 @@ impl ExchangeConnector for BybitConnector {
 }
 
 impl BybitConnector {
-    /// Single WS connection loop with ping heartbeat (20s), subscribe, and 24h reconnect.
+    /// Цикл с одним WebSocket-соединением, 
+    /// включающий поддержание связи через ping (интервал 20 с), 
+    /// подписку и переподключение каждые 24 часа.
     async fn ws_loop(
         ws_base: &str,
         args: &[String],
@@ -229,24 +236,33 @@ impl BybitConnector {
         tx: &tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(ws_base, None, true).await?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(ws_base, None, true).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        // Bybit Spot: max 10 args per subscribe request (futures/perp: no limit)
-        let chunk_size = if *market_type == MarketType::Spot { 10 } else { args.len().max(1) };
+        // Bybit Spot: максимум 10 аргументов в одном SUBSCRIBE сообщении (Bybit API ограничение)
+        let chunk_size = if *market_type == MarketType::Spot {
+            10
+        } else {
+            args.len().max(1)
+        };
         for chunk in args.chunks(chunk_size) {
             let subscribe_msg = serde_json::json!({
                 "op": "subscribe",
                 "args": chunk
             });
-            write.send(Message::Text(subscribe_msg.to_string().into())).await?;
+            write
+                .send(Message::Text(subscribe_msg.to_string().into()))
+                .await?;
         }
         info!(
             "Bybit {} WS subscribed: {} topics (chunk={})",
-            market_type, args.len(), chunk_size
+            market_type,
+            args.len(),
+            chunk_size
         );
 
-        // Bybit requires ping every 20s or connection gets closed
+        // Bybit требует отправки пинга каждые 20 секунд, иначе соединение разрывается.
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
         let connected_since = Instant::now();
         const MAX_CONN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
@@ -296,35 +312,36 @@ impl BybitConnector {
     fn parse_trade_message(text: &str) -> Option<Vec<NormalizedTrade>> {
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
-        // Subscription confirmation
+        // Сообщение подтверждения подписки
         if v.get("op").and_then(|o| o.as_str()) == Some("subscribe") {
             debug!("Bybit WS subscription confirmed");
             return None;
         }
 
-        // Only process trade data topics
+        // Обрабатываем только топики с данными о сделках
         let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
         if !topic.starts_with("publicTrade.") {
             return None;
         }
 
-        // Trade data: {"topic":"publicTrade.BTCUSDT","type":"delta","data":[{"T":"...","s":"BTCUSDT","p":"...","v":"..."}]}
+        // Данные сделки: {"topic":"publicTrade.BTCUSDT","type":"delta","data":[{"T":"...","s":"BTCUSDT","p":"...","v":"..."}]}
         let data = v.get("data")?.as_array()?;
         let mut trades = Vec::with_capacity(data.len());
 
         for item in data {
-            // Fields are directly on each item, NOT nested under a "d" key
+            // Поля находятся непосредственно в каждом элементе, а не вложены в ключ «d».
             let symbol = item.get("s")?.as_str()?.to_string();
 
-            // Parse the raw Bybit symbol to unified
+            // Преобразуем исходный тикер в унифицированный формат
             let (base, quote) = Self::parse_bybit_symbol(&symbol)?;
             let unified = format!("{}/{}", base, quote);
 
             let price: f64 = item.get("p")?.as_str()?.parse().ok()?;
             let size: f64 = item.get("v")?.as_str()?.parse().ok()?;
 
-            // Bybit sends timestamp as a string, e.g. "T": "1670608600000"
-            let timestamp: i64 = item.get("T")
+            // Bybit шлёт таймстемпы в строковом формате, например "T": "1670608600000"
+            let timestamp: i64 = item
+                .get("T")
                 .and_then(|t| t.as_str().and_then(|s| s.parse().ok()))
                 .or_else(|| item.get("T").and_then(|t| t.as_i64()))?;
 

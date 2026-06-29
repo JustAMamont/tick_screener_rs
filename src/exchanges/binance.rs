@@ -4,8 +4,8 @@ use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::Message;
 use std::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 pub struct BinanceConnector {
@@ -42,17 +42,17 @@ impl BinanceConnector {
     fn parse_binance_symbol(raw: &str) -> Option<(String, String)> {
         let quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH", "FDUSD", "TUSD"];
         for q in quotes {
-            if let Some(base) = raw.strip_suffix(q) {
-                if !base.is_empty() {
-                    return Some((base.to_string(), q.to_string()));
-                }
+            if let Some(base) = raw.strip_suffix(q)
+                && !base.is_empty()
+            {
+                return Some((base.to_string(), q.to_string()));
             }
         }
         None
     }
 }
 
-// REST API Structures
+// Структуры REST API биржи
 #[derive(Debug, Deserialize)]
 struct BinanceExchangeInfo {
     symbols: Vec<BinanceSymbol>,
@@ -92,10 +92,12 @@ impl ExchangeConnector for BinanceConnector {
                 if m.status != "TRADING" {
                     return None;
                 }
-                
+
                 let unified = match self.market_type {
                     MarketType::Spot => format!("{}/{}", m.base_asset, m.quote_asset),
-                    MarketType::Perp => format!("{}/{}:{}", m.base_asset, m.quote_asset, m.quote_asset),
+                    MarketType::Perp => {
+                        format!("{}/{}.P", m.base_asset, m.quote_asset)
+                    }
                 };
 
                 Some(MarketInfo {
@@ -109,7 +111,11 @@ impl ExchangeConnector for BinanceConnector {
             })
             .collect();
 
-        info!("Binance {} loaded {} markets", self.market_type, markets.len());
+        info!(
+            "Binance {} loaded {} markets",
+            self.market_type,
+            markets.len()
+        );
         Ok(markets)
     }
 
@@ -119,7 +125,7 @@ impl ExchangeConnector for BinanceConnector {
         tx: tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        // Binance WS expects lowercase symbols for stream names
+        // Binance WS ожидает символы в нижнем регистре для имён стримов
         let binance_streams: Vec<String> = symbols
             .iter()
             .map(|s| format!("{}@aggTrade", self.to_native_symbol(s).to_lowercase()))
@@ -133,7 +139,10 @@ impl ExchangeConnector for BinanceConnector {
                 break Ok(());
             }
 
-            match self.connect_and_stream(&binance_streams, &tx, &cancel).await {
+            match self
+                .connect_and_stream(&binance_streams, &tx, &cancel)
+                .await
+            {
                 Ok(()) => break Ok(()),
                 Err(e) => {
                     if cancel.is_cancelled() {
@@ -144,7 +153,8 @@ impl ExchangeConnector for BinanceConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    let jitter =
+                        std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
                     retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                 }
             }
@@ -152,7 +162,8 @@ impl ExchangeConnector for BinanceConnector {
     }
 
     fn to_native_symbol(&self, unified: &str) -> String {
-        let without_settle = unified.split(':').next().unwrap_or(unified);
+        // Убираем .P-суффикс (если есть) перед разбором.
+        let without_settle = unified.strip_suffix(".P").unwrap_or(unified);
         if let Some((base, quote)) = without_settle.split_once('/') {
             format!("{}{}", base, quote)
         } else {
@@ -163,18 +174,16 @@ impl ExchangeConnector for BinanceConnector {
     fn to_unified_symbol(&self, native: &str) -> Option<String> {
         let native_upper = native.to_uppercase();
         let (base, quote) = BinanceConnector::parse_binance_symbol(&native_upper)?;
-        let unified = format!("{}/{}", base, quote);
-        
-        let unified = if self.market_type == MarketType::Perp {
-            format!("{}:{}", unified, quote)
+        let suffix = if self.market_type == MarketType::Perp {
+            ".P"
         } else {
-            unified
+            ""
         };
-        Some(unified)
+        Some(format!("{}/{}{}", base, quote, suffix))
     }
 
     fn max_subscribe_args(&self) -> usize {
-        // Binance max is 200 streams per SUBSCRIBE request
+        // Binance допускает до 200 айтемов в одном SUBSCRIBE сообщении
         200
     }
 }
@@ -186,7 +195,8 @@ impl BinanceConnector {
         tx: &tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Подписываемся чанками, так как лимит 200 на одно сообщение
@@ -196,12 +206,15 @@ impl BinanceConnector {
                 "params": chunk,
                 "id": i + 1
             });
-            write.send(Message::Text(subscribe_msg.to_string().into())).await?;
+            write
+                .send(Message::Text(subscribe_msg.to_string().into()))
+                .await?;
         }
-        
+
         info!(
             "Binance {} WS subscribed to {} streams",
-            self.market_type, streams.len()
+            self.market_type,
+            streams.len()
         );
 
         // Binance рекомендует слать ping раз в 3-5 минут для поддержки соединения
@@ -212,7 +225,7 @@ impl BinanceConnector {
         loop {
             tokio::select! {
                 _ = ping_interval.tick() => {
-                    // Tungstenite автоматически отвечает на входящие PING, но мы можем отправлять PONG 
+                    // Tungstenite автоматически отвечает на входящие PING, но мы можем отправлять PONG
                     // или пустой кадр PING сами, чтобы избежать отключения из-за неактивности
                     if write.send(Message::Ping(vec![].into())).await.is_err() {
                         anyhow::bail!("Failed to send ping");
@@ -221,11 +234,10 @@ impl BinanceConnector {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Some(trade) = Self::parse_agg_trade(&text, self.market_type) {
-                                if tx.send(trade).is_err() {
+                            if let Some(trade) = Self::parse_agg_trade(&text, self.market_type)
+                                && tx.send(trade).is_err() {
                                     // Каналы могут не иметь подписчиков временно, это норм
                                 }
-                            }
                         }
                         Some(Ok(Message::Ping(data))) => {
                             let _ = write.send(Message::Pong(data)).await;
@@ -254,18 +266,18 @@ impl BinanceConnector {
 
         // Мы используем /stream endpoint, поэтому структура: {"stream": "...", "data": {...}}
         let data = v.get("data")?;
-        
+
         let event_type = data.get("e")?.as_str()?;
         if event_type != "aggTrade" {
             return None;
         }
 
         let symbol = data.get("s")?.as_str()?; // Пример: "BTCUSDT"
-        
+
         // Переводим в унифицированный формат
         let (base, quote) = Self::parse_binance_symbol(symbol)?;
         let unified = if market_type == MarketType::Perp {
-            format!("{}/{}:{}", base, quote, quote)
+            format!("{}/{}.P", base, quote)
         } else {
             format!("{}/{}", base, quote)
         };

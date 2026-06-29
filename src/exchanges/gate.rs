@@ -4,8 +4,8 @@ use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::Message;
 use std::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 pub struct GateConnector {
@@ -39,7 +39,7 @@ impl GateConnector {
     }
 
     fn parse_gate_symbol(raw: &str) -> Option<(String, String)> {
-        // Gate uses BTC_USDT format
+        // У Gate формат тикеров - BTC_USDT
         let parts: Vec<&str> = raw.split('_').collect();
         if parts.len() >= 2 {
             Some((parts[0].to_string(), parts[1].to_string()))
@@ -80,52 +80,51 @@ impl ExchangeConnector for GateConnector {
 
     async fn load_markets(&self) -> anyhow::Result<Vec<MarketInfo>> {
         let (url, _expected_type) = match self.market_type {
-            MarketType::Spot => (
-                format!("{}/spot/currency_pairs", self.rest_base),
-                "spot",
-            ),
-            MarketType::Perp => (
-                format!("{}/futures/usdt/contracts", self.rest_base),
-                "perp",
-            ),
+            MarketType::Spot => (format!("{}/spot/currency_pairs", self.rest_base), "spot"),
+            MarketType::Perp => (format!("{}/futures/usdt/contracts", self.rest_base), "perp"),
         };
 
         let markets: Vec<MarketInfo> = match self.market_type {
             MarketType::Spot => {
                 let resp: Vec<GateSpotMarket> = self.client.get(&url).send().await?.json().await?;
-                resp.into_iter().filter_map(|m| {
-                    if m.trade_status != "tradable" {
-                        return None;
-                    }
-                    let (base, quote) = GateConnector::parse_gate_symbol(&m.id)?;
-                    let unified = format!("{}/{}", base, quote);
-                    Some(MarketInfo {
-                        symbol: unified,
-                        base,
-                        quote,
-                        active: true,
-                        market_type: self.market_type,
-                        raw_symbol: m.id,
+                resp.into_iter()
+                    .filter_map(|m| {
+                        if m.trade_status != "tradable" {
+                            return None;
+                        }
+                        let (base, quote) = GateConnector::parse_gate_symbol(&m.id)?;
+                        let unified = format!("{}/{}", base, quote);
+                        Some(MarketInfo {
+                            symbol: unified,
+                            base,
+                            quote,
+                            active: true,
+                            market_type: self.market_type,
+                            raw_symbol: m.id,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             MarketType::Perp => {
-                let resp: Vec<GateFuturesMarket> = self.client.get(&url).send().await?.json().await?;
-                resp.into_iter().filter_map(|m| {
-                    if m.status != "trading" {
-                        return None;
-                    }
-                    let (base, quote) = GateConnector::parse_gate_symbol(&m.name)?;
-                    let unified = format!("{}/{}:{}", base, quote, quote);
-                    Some(MarketInfo {
-                        symbol: unified,
-                        base,
-                        quote,
-                        active: true,
-                        market_type: self.market_type,
-                        raw_symbol: m.name,
+                let resp: Vec<GateFuturesMarket> =
+                    self.client.get(&url).send().await?.json().await?;
+                resp.into_iter()
+                    .filter_map(|m| {
+                        if m.status != "trading" {
+                            return None;
+                        }
+                        let (base, quote) = GateConnector::parse_gate_symbol(&m.name)?;
+                        let unified = format!("{}/{}.P", base, quote);
+                        Some(MarketInfo {
+                            symbol: unified,
+                            base,
+                            quote,
+                            active: true,
+                            market_type: self.market_type,
+                            raw_symbol: m.name,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
         };
 
@@ -142,20 +141,20 @@ impl ExchangeConnector for GateConnector {
         let gate_symbols: Vec<String> = symbols
             .iter()
             .filter_map(|s| {
-                let without_settle = s.split(':').next()?;
+                let without_settle = s.strip_suffix(".P").unwrap_or(s);
                 let (base, quote) = without_settle.split_once('/')?;
                 Some(format!("{}_{}", base, quote))
             })
             .collect();
 
-        // Gate spot trades channel: spot.trades
-        // Gate futures trades channel: futures.trades
+        // Канал сделок Gate spot: spot.trades
+        // Канал сделок Gate futures: futures.trades
         let channel = match self.market_type {
             MarketType::Spot => "spot.trades",
             MarketType::Perp => "futures.trades",
         };
 
-        // Gate expects payload as flat array of symbol strings
+        // Gate ожидает полезную нагрузку в виде массива тикеров.
         let subscribe_msg = serde_json::json!({
             "time": chrono::Utc::now().timestamp(),
             "channel": channel,
@@ -173,13 +172,16 @@ impl ExchangeConnector for GateConnector {
             match self.connect_and_stream(&subscribe_msg, &tx, &cancel).await {
                 Ok(()) => break Ok(()),
                 Err(e) => {
-                    if cancel.is_cancelled() { break Ok(()); }
+                    if cancel.is_cancelled() {
+                        break Ok(());
+                    }
                     warn!("Gate WS error, retrying in {:?}: {}", retry_delay, e);
                     tokio::select! {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    let jitter =
+                        std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
                     retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                 }
             }
@@ -187,7 +189,7 @@ impl ExchangeConnector for GateConnector {
     }
 
     fn to_native_symbol(&self, unified: &str) -> String {
-        let without_settle = unified.split(':').next().unwrap_or(unified);
+        let without_settle = unified.strip_suffix(".P").unwrap_or(unified);
         if let Some((base, quote)) = without_settle.split_once('/') {
             format!("{}_{}", base, quote)
         } else {
@@ -197,17 +199,16 @@ impl ExchangeConnector for GateConnector {
 
     fn to_unified_symbol(&self, native: &str) -> Option<String> {
         let (base, quote) = GateConnector::parse_gate_symbol(native)?;
-        let unified = format!("{}/{}", base, quote);
-        let unified = if self.market_type == MarketType::Perp {
-            format!("{}:{}", unified, quote)
+        let suffix = if self.market_type == MarketType::Perp {
+            ".P"
         } else {
-            unified
+            ""
         };
-        Some(unified)
+        Some(format!("{}/{}{}", base, quote, suffix))
     }
 
     fn max_subscribe_args(&self) -> usize {
-        // Gate: no known per-message limit
+        // Gate: нет известного лимита на количество аргументов в одном сообщении
         0
     }
 }
@@ -219,12 +220,15 @@ impl GateConnector {
         tx: &tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        write.send(Message::Text(subscribe_msg.to_string().into())).await?;
+        write
+            .send(Message::Text(subscribe_msg.to_string().into()))
+            .await?;
 
-        // Gate requires periodic ping
+        // Gate требует периодический ping
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         let connected_since = Instant::now();
@@ -267,7 +271,7 @@ impl GateConnector {
     fn parse_trade_message(text: &str, market_type: MarketType) -> Option<Vec<NormalizedTrade>> {
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
-        // Skip non-trade messages (subscription confirmations, etc)
+        // Скипаем не нужные сообщения (subscription confirmations, etc)
         let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
         if event != "update" {
             return None;
@@ -280,7 +284,7 @@ impl GateConnector {
 
         match market_type {
             MarketType::Spot => {
-                // Spot: result is a single object
+                // Spot: результат - единственный объект
                 // {"result":{"currency_pair":"BTC_USDT","amount":"0.028","price":"68178.5","create_time_ms":"1774993737638.792000"}}
                 let result = v.get("result")?;
                 let symbol = result.get("currency_pair")?.as_str()?.to_string();
@@ -289,7 +293,8 @@ impl GateConnector {
 
                 let price: f64 = result.get("price")?.as_str()?.parse().ok()?;
                 let size: f64 = result.get("amount")?.as_str()?.parse().ok()?;
-                let create_time_ms: f64 = result.get("create_time_ms")
+                let create_time_ms: f64 = result
+                    .get("create_time_ms")
                     .and_then(|t| t.as_str().and_then(|s| s.parse().ok()))
                     .or_else(|| result.get("create_time_ms").and_then(|t| t.as_f64()))
                     .unwrap_or(0.0);
@@ -303,7 +308,7 @@ impl GateConnector {
                 }])
             }
             MarketType::Perp => {
-                // Futures: result is an array of objects
+                // Futures: результат - массив объектов
                 // {"result":[{"id":...,"size":-67,"create_time_ms":1775000128579,"price":"68244.1","contract":"BTC_USDT"}]}
                 let results = v.get("result")?.as_array()?;
                 let mut trades = Vec::with_capacity(results.len());
@@ -311,18 +316,26 @@ impl GateConnector {
                 for item in results {
                     let symbol = item.get("contract")?.as_str()?.to_string();
                     let (base, quote) = Self::parse_gate_symbol(&symbol)?;
-                    let unified = format!("{}/{}:{}", base, quote, quote);
+                    let unified = format!("{}/{}.P", base, quote);
 
                     let price: f64 = item.get("price")?.as_str()?.parse().ok()?;
-                    // size can be negative (sell) — use abs for cost calc
-                    let size: f64 = item.get("size")
+                    // размер может быть отрицательным (продажа) - для расчета стоимости берём значение по модулю
+                    let size: f64 = item
+                        .get("size")
                         .and_then(|s| s.as_i64())
-                        .or_else(|| item.get("size").and_then(|s| s.as_str().and_then(|v| v.parse().ok())))
+                        .or_else(|| {
+                            item.get("size")
+                                .and_then(|s| s.as_str().and_then(|v| v.parse().ok()))
+                        })
                         .map(|s| s.abs() as f64)
                         .unwrap_or(0.0);
-                    let timestamp_ms: i64 = item.get("create_time_ms")
+                    let timestamp_ms: i64 = item
+                        .get("create_time_ms")
                         .and_then(|t| t.as_i64())
-                        .or_else(|| item.get("create_time_ms").and_then(|t| t.as_str().and_then(|s| s.parse().ok())))
+                        .or_else(|| {
+                            item.get("create_time_ms")
+                                .and_then(|t| t.as_str().and_then(|s| s.parse().ok()))
+                        })
                         .unwrap_or(0);
 
                     trades.push(NormalizedTrade {
@@ -334,7 +347,11 @@ impl GateConnector {
                     });
                 }
 
-                if trades.is_empty() { None } else { Some(trades) }
+                if trades.is_empty() {
+                    None
+                } else {
+                    Some(trades)
+                }
             }
         }
     }

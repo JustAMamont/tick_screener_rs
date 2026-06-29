@@ -1,9 +1,10 @@
 [package]
 name = "tick-screener"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "High-performance multi-exchange market anomaly scanner"
+description = "Высокопроизводительный сканер аномалий торговых пар на нескольких биржах"
 authors = ["JustAMamont"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "signal"] }
@@ -35,9 +36,45 @@ tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 prost = "0.14.3"
 
+# Опциональная поддержка io_uring для асинхронного файлового I/O.
+# Включите через `--features uring` для использования tokio-uring
+# при чтении конфига и записи логов. Требует Linux 5.1+.
+tokio-uring = { version = "0.5", optional = true }
+
+[dev-dependencies]
+# Для юнит-тестов и бенчей.
+tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[features]
+default = []
+# Активирует io_uring-рентайм для файловых операций. Только Linux 5.1+.
+uring = ["dep:tokio-uring"]
+
+# Бенчи: `cargo bench --features bench`
+bench = []
+
+[[bench]]
+name = "interner"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "scanner_core"
+harness = false
+required-features = ["bench"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Профиль для бенчей: оптимизации как в release, но с debug-символами
+# для профайлинга.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true

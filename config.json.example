@@ -1,22 +1,228 @@
-[
-    {
-        "scan": "mexc_fut",
-        "blacklist": [],
-        "currency_type": "perp",
-        "quote": "*USD",   // *USD - All stables or USDT or USDC etc 
-        "alert_settings": {
-            "return_limit": 1,
-            "volume_limit": 2000,
-            "trange": 1,
-            "telegram": {
-                "bot_token": "your_bot_token",
-                "chat_id": -100123456789
+{
+    "global_params": {
+        "log_level": "tick_screener=info,warn",
+        "log_retention_days": 7
+    },
+    "scanners": [
+        {
+            "scan": "bitget_fut",
+            "blacklist": [],
+            "currency_type": "perp",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567890
+                },
+                "delimiter": ""
             },
-            "delimiter": ""
+            "process_settings": {
+                "pairs_batch_size": 200,
+                "launch_delay": 1.0
+            }
         },
-        "process_settings": {
-            "pairs_batch_size": 1000,
-            "launch_delay": 1.0
+        {
+            "scan": "bitget_spot",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 2001,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567891
+                },
+                "delimiter": ""
+            },
+            "process_settings": {
+                "pairs_batch_size": 100,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "bybit_fut",
+            "blacklist": [],
+            "currency_type": "perp",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567892
+                },
+                "delimiter": ""
+            },
+            "process_settings": {
+                "pairs_batch_size": 200,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "bybit_spot",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567893
+                },
+                "delimiter": ""
+            },
+            "process_settings": {
+                "pairs_batch_size": 10,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "gate_fut",
+            "blacklist": [],
+            "currency_type": "perp",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 2000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567894
+                },
+                "delimiter": "/"
+            },
+            "process_settings": {
+                "pairs_batch_size": 300,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "gate_spot",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 2000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567895
+                },
+                "delimiter": "/"
+            },
+            "process_settings": {
+                "pairs_batch_size": 300,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "gate_spot_max",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567896
+                },
+                "delimiter": "/"
+            },
+            "process_settings": {
+                "pairs_batch_size": 300,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "kucoin_fut",
+            "blacklist": [],
+            "currency_type": "perp",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 5,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567897
+                },
+                "delimiter": "-"
+            },
+            "process_settings": {
+                "pairs_batch_size": 75,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "kucoin_spot",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 10000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567898
+                },
+                "delimiter": "-"
+            },
+            "process_settings": {
+                "pairs_batch_size": 75,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "mexc_spot",
+            "blacklist": [],
+            "currency_type": "spot",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 2000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -1001234567899
+                },
+                "delimiter": ""
+            },
+            "process_settings": {
+                "pairs_batch_size": 30,
+                "launch_delay": 1.0
+            }
+        },
+        {
+            "scan": "mexc_fut",
+            "blacklist": [],
+            "currency_type": "perp",
+            "quote": "*USD",
+            "alert_settings": {
+                "return_limit": 2,
+                "volume_limit": 2000,
+                "trange": 1,
+                "telegram": {
+                    "bot_token": "bot_token",
+                    "chat_id": -100123456790
+                },
+                "delimiter": ""
+            },
+            "process_settings": {
+                "pairs_batch_size": 30,
+                "launch_delay": 1.0
+            }
         }
-    }
-]
+    ]
+}

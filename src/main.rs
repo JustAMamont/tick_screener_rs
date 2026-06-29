@@ -1,3 +1,9 @@
+//! Точка входа в приложение: разбор аргументов, инициализация и запуск.
+//!
+//! Создаёт `App`, инициализирует конфиг-вотчер, фид-менеджер, сканеры,
+//! AlertRouter и фоновые таски (мониторинг, рефреш pairlist-ов, hot-reload).
+//! Завершение по `Ctrl+C` с корректным graceful shutdown-ом.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,8 +12,8 @@ use std::time::Duration;
 use tick_screener::{
     alert::{AlertRouter, BotPool},
     config::{
-        model::{ConfigSnapshot, FeedKey, ScannerRuntimeConfig},
         ConfigRegistry, ConfigWatcher,
+        model::{ConfigSnapshot, FeedKey, ScannerRuntimeConfig},
     },
     feed::FeedManager,
     interner::SymbolInterner,
@@ -15,24 +21,41 @@ use tick_screener::{
     scanner::{Alert, ScannerCore, TradeProcessor},
 };
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-/// Application state shared across components.
+/// Состояние приложения, разделяемое между компонентами.
+///
+/// Все поля - `Arc` или `Arc<RwLock<...>>`, что позволяет безопасно
+/// делить состояние между tokio-тасками.
 struct App {
+    /// Глобальный токен отмены. Завершает все фоновые таски при `Ctrl+C`.
     cancel: CancellationToken,
+    /// Путь к `config.json`. Используется только для диагностики.
     #[allow(dead_code)]
     config_path: PathBuf,
+    /// Реестр конфигурации (текущий снэпшот + вычисление diff).
     registry: Arc<ConfigRegistry>,
+    /// Ядра сканеров по `scanner_id`. Каждый сканер имеет свой `ScannerCore`.
     scanner_cores: Arc<RwLock<HashMap<String, Arc<ScannerCore>>>>,
+    /// Текущие конфиги сканеров. Читается `AlertRouter`-ом для маршрутизации алертов.
     scanner_configs: Arc<RwLock<Vec<ScannerRuntimeConfig>>>,
+    /// Arc-обёртки конфигов - позволяют hot-reload-ить отдельные сканеры.
     scanner_config_arcs: Arc<RwLock<HashMap<String, Arc<RwLock<ScannerRuntimeConfig>>>>>,
+    /// Менеджер разделяемых фидов (`(exchange, market_type)` -> WS-стрим).
     feed_manager: Arc<FeedManager>,
+    /// Канал отправки алертов: `(scanner_id, Alert)` -> `AlertRouter`.
     alert_tx: mpsc::Sender<(String, Alert)>,
+    /// Пул Telegram-ботов (дедуплицированный по токену).
     bot_pool: BotPool,
+    /// JoinHandle-ы тасок процессоров трейдов (для graceful shutdown).
     processor_handles: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Разделяемый интернер символов.
     interner: Arc<SymbolInterner>,
+    /// Runtime логирования: позволяет применять новый `log_level`
+    /// и `log_retention_days` при hot-reload.
+    log_runtime: logging::LogRuntime,
 }
 
 impl App {
@@ -41,6 +64,7 @@ impl App {
         initial_snapshot: Arc<ConfigSnapshot>,
         alert_tx: mpsc::Sender<(String, Alert)>,
         interner: Arc<SymbolInterner>,
+        log_runtime: logging::LogRuntime,
     ) -> Self {
         let feed_manager = Arc::new(FeedManager::new(Arc::clone(&interner)));
         let registry = Arc::new(ConfigRegistry::new(initial_snapshot));
@@ -57,6 +81,7 @@ impl App {
             bot_pool: BotPool::new(),
             processor_handles: Arc::new(RwLock::new(HashMap::new())),
             interner,
+            log_runtime,
         }
     }
 
@@ -80,26 +105,31 @@ impl App {
         let feed_key = FeedKey::new(scanner_config.exchange, scanner_config.market_type);
 
         let core = Arc::new(ScannerCore::new(Arc::clone(&self.interner)));
-        self.scanner_cores.write().await.insert(scanner_id.clone(), Arc::clone(&core));
+        self.scanner_cores
+            .write()
+            .await
+            .insert(scanner_id.clone(), Arc::clone(&core));
 
         // Добавлен .await, так как функция теперь асинхронная
-        let trade_rx = self.feed_manager.subscribe(&feed_key, &scanner_id, scanner_config).await;
+        let trade_rx = self
+            .feed_manager
+            .subscribe(&feed_key, &scanner_id, scanner_config)
+            .await;
 
         let config_arc = Arc::new(RwLock::new(scanner_config.clone()));
         config_arcs.insert(scanner_id.clone(), Arc::clone(&config_arc));
 
-        let processor = TradeProcessor::new(
-            scanner_id.clone(),
-            core,
-            config_arc,
-            self.alert_tx.clone(),
-        );
+        let processor =
+            TradeProcessor::new(scanner_id.clone(), core, config_arc, self.alert_tx.clone());
 
         let handle = tokio::spawn(async move {
             processor.run(trade_rx).await;
         });
 
-        self.processor_handles.write().await.insert(scanner_id.clone(), handle);
+        self.processor_handles
+            .write()
+            .await
+            .insert(scanner_id.clone(), handle);
 
         info!(
             "Scanner '{}' started (exchange={}, market={}, quote={})",
@@ -110,19 +140,31 @@ impl App {
     async fn apply_diff(&self, snapshot: Arc<ConfigSnapshot>) {
         let diff = self.registry.update(snapshot.clone());
 
+        // Применяем изменения global_params (log_level, log_retention_days)
+        // в рантайме - не зависит от топологии сканеров.
+        if diff.global_params_changed {
+            info!(
+                "Applying global_params update: log_level={}, log_retention_days={}",
+                snapshot.global_params.log_level, snapshot.global_params.log_retention_days
+            );
+            self.log_runtime.apply_global_params(&snapshot.global_params);
+        }
+
         if diff.is_empty() {
             info!("Config reloaded but no changes detected");
             return;
         }
 
         info!(
-            "Config diff: added={:?} removed={:?} modified={:?} feeds_added={:?} feeds_removed={:?}",
+            "Config diff: added={:?} removed={:?} modified={:?} feeds_added={:?} feeds_removed={:?} global_params_changed={}",
             diff.added, diff.removed, diff.modified, diff.feeds_added, diff.feeds_removed,
+            diff.global_params_changed,
         );
 
         *self.scanner_configs.write().await = snapshot.scanners.clone();
 
-        // Update per-scanner config arcs so TradeProcessor sees new values on next batch
+        // Обновление конфигурационных параметров для каждого сканера, 
+        // чтобы TradeProcessor увидел новые значения при обработке следующего батча.
         {
             let config_arcs = self.scanner_config_arcs.write().await;
             for scanner_config in &snapshot.scanners {
@@ -138,15 +180,23 @@ impl App {
 
         let mut config_arcs = self.scanner_config_arcs.write().await;
         for scanner_id in &diff.added {
-            if let Some(config) = snapshot.scanners.iter().find(|s| &s.scanner_id == scanner_id) {
+            if let Some(config) = snapshot
+                .scanners
+                .iter()
+                .find(|s| &s.scanner_id == scanner_id)
+            {
                 self.spawn_scanner(config, &mut config_arcs).await;
                 info!("Scanner '{}' added via hot-reload", scanner_id);
             }
         }
 
         for scanner_id in &diff.modified {
-            // Log what actually changed in the scanner config
-            if let Some(new_cfg) = snapshot.scanners.iter().find(|s| &s.scanner_id == scanner_id) {
+            // Дампим в лог, что именно изменилось в конфигурации сканера.
+            if let Some(new_cfg) = snapshot
+                .scanners
+                .iter()
+                .find(|s| &s.scanner_id == scanner_id)
+            {
                 info!(
                     "Scanner '{}' config updated via hot-reload: return_limit={} volume_limit={} trange={} pairs_batch_size={}",
                     scanner_id,
@@ -174,7 +224,7 @@ impl App {
             let configs = self.scanner_configs.read().await;
             configs
                 .iter()
-                .find(|c| &c.scanner_id == scanner_id)
+                .find(|c| c.scanner_id == *scanner_id)
                 .map(|c| FeedKey::new(c.exchange, c.market_type))
         };
 
@@ -219,24 +269,34 @@ async fn run_pairlist_refresher(
                     match connector.load_markets().await {
                         Ok(markets) => {
                             let current_symbols: HashSet<String> = markets.into_iter().map(|m| m.symbol).collect();
-                            
+
                             if let Some(previous) = historical_pairlists.get(&key) {
                                 let new_pairs: Vec<String> = current_symbols.difference(previous).cloned().collect();
-                                
+
                                 for pair in new_pairs {
                                     info!("⚡️ NEW LISTING detected: {} on {:?}", pair, key);
-                                    
+
                                     for scanner_config in configs.iter() {
                                         let sk = FeedKey::new(scanner_config.exchange, scanner_config.market_type);
                                         if sk == key {
-                                            let quote = pair.split(':').next().and_then(|s| s.split('/').nth(1)).unwrap_or("");
+                                            // Извлекаем котировку из unified-символа
+                                            // `BTC/USDT` -> `USDT`, `BTC/USDT.P` -> `USDT`.
+                                            let quote = pair
+                                                .split('/')
+                                                .nth(1)
+                                                .map(|s| s.strip_suffix(".P").unwrap_or(s))
+                                                .unwrap_or("");
                                             if !scanner_config.quote_aliases.iter().any(|q| q == quote) {
                                                 continue;
                                             }
 
-                                            let display = pair.replace('/', &scanner_config.alert_settings.delimiter)
-                                                              .split(':').next().unwrap_or(&pair).to_string();
-                                            
+                                            // Для отображения отрезаем `.P` и заменяем `/` на разделитель.
+                                            let display_with_delim = pair.replace('/', &scanner_config.alert_settings.delimiter);
+                                            let display = display_with_delim
+                                                .strip_suffix(".P")
+                                                .unwrap_or(&display_with_delim)
+                                                .to_string();
+
                                             let msg = format!(
                                                 "⚡️ ⚡️ ⚡️ *NEW LISTING* ⚡️ ⚡️ ⚡️\n\n`{}`\nExchange: *{}*\nMarket: *{}*",
                                                 display, key.exchange, key.market_type
@@ -254,7 +314,7 @@ async fn run_pairlist_refresher(
                                     }
                                 }
                             }
-                            
+
                             historical_pairlists.insert(key, current_symbols);
                         }
                         Err(e) => {
@@ -264,7 +324,7 @@ async fn run_pairlist_refresher(
                 }
                 drop(configs);
 
-                // Check for dead feeds (empty pairlists)
+                // Проверка мертвых фидов (вебсокетов) 
                 for (feed_key, config) in feed_manager.feeds_needing_repair() {
                     warn!(
                         "Dead feed detected: {:?} has empty pairlist, triggering repair",
@@ -296,7 +356,7 @@ async fn run_pairlist_refresher(
 
 #[tokio::main]
 async fn main() {
-    logging::init_logger();
+    let log_runtime = logging::init_logger();
     info!("tick-screener starting (Rust edition 2024)");
 
     let config_path = PathBuf::from("config.json");
@@ -306,6 +366,9 @@ async fn main() {
     let initial_snapshot = match watcher.load_initial() {
         Ok(s) => {
             info!("Initial config loaded: {} scanners", s.scanners.len());
+            // Применяем начальные global_params (log_level, retention)
+            // к runtime логирования.
+            log_runtime.apply_global_params(&s.global_params);
             s
         }
         Err(e) => {
@@ -314,27 +377,39 @@ async fn main() {
         }
     };
 
-    // Create shared alert channel
+    // Создаём разделяемый канал алертов
     let (alert_tx, alert_rx) = mpsc::channel(1024);
 
-    // Create shared interner
+    // Создаём разделяемый интернер
     let interner = Arc::new(SymbolInterner::new());
 
-    // Create app
-    let mut app = App::new(config_path, initial_snapshot, alert_tx.clone(), Arc::clone(&interner));
+    // Создаём приложение
+    let mut app = App::new(
+        config_path,
+        initial_snapshot,
+        alert_tx.clone(),
+        Arc::clone(&interner),
+        log_runtime.clone(),
+    );
     app.build_topology(&app.registry.snapshot()).await;
 
-    // Wrap app in Arc<Mutex> for hot-reload access
+    // Запускаем фоновую таску очистки старых логов.
+    // Крутится всё время работы приложения, читает актуальный retention_days
+    // из log_runtime (включая hot-reload) каждые 5 минут.
+    let cleanup_cancel = app.cancel.clone();
+    logging::spawn_log_cleanup_task(log_runtime.clone(), cleanup_cancel);
+
+    // Оборачиваем приложение в Arc<Mutex> для доступа из hot-reload
     let app = Arc::new(Mutex::new(app));
 
-    // Start config watcher
+    // Запускаем вотчер конфига
     let config_cancel = CancellationToken::new();
     let config_cancel_clone = config_cancel.clone();
     let config_handle = tokio::spawn(async move {
         watcher.run(config_cancel_clone).await;
     });
 
-    // Start alert router
+    // Запускаем роутер алертов
     let scanner_configs_for_router = {
         let a = app.lock().await;
         Arc::clone(&a.scanner_configs)
@@ -348,7 +423,7 @@ async fn main() {
         alert_router.run().await;
     });
 
-    // Start monitor
+    // Запускаем монитор
     let monitor_cancel = {
         let a = app.lock().await;
         a.cancel.clone()
@@ -397,7 +472,7 @@ async fn main() {
         }
     });
 
-    // Start pairlist refresher (listing detection)
+    // Старт обновлятора списка пар
     let refresh_cancel = {
         let a = app.lock().await;
         a.cancel.clone()
@@ -417,7 +492,7 @@ async fn main() {
         refresh_cancel,
     ));
 
-    // Config reload loop — full topology hot-reload
+    // Hot-reload конфига (изменение параметров сканеров, добавление/удаление сканеров в процессе работы)
     let reload_cancel = {
         let a = app.lock().await;
         a.cancel.clone()
@@ -444,21 +519,21 @@ async fn main() {
         }
     });
 
-    // Handle Ctrl+C
+    // Хендлеры остановки программы
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down...");
         }
     }
 
-    // Graceful shutdown
+    // Корректное завершение работы
     info!("Initiating graceful shutdown...");
 
-    // 1. Cancel config watcher
+    // 1. Отменяем вотчер конфига
     config_cancel.cancel();
     config_handle.abort();
 
-    // 2. Cancel app-wide token (monitor, refresh, reload all use clones of this)
+    // 2. Отменяем глобальный токен (monitor, refresh, reload используют его клоны)
     {
         let app = app.lock().await;
         app.cancel.cancel();
@@ -470,12 +545,12 @@ async fn main() {
         }
     }
 
-    // 3. Abort background tasks directly
+    // 3. Абортим фоновые таски напрямую
     monitor_handle.abort();
     refresh_handle.abort();
     reload_handle.abort();
 
-    // 4. Drop alert_tx so alert_rx closes and AlertRouter exits
+    // 4. Дропаем alert_tx, чтобы alert_rx закрылся и AlertRouter завершился
     drop(alert_tx);
     match tokio::time::timeout(Duration::from_secs(3), &mut alert_handle).await {
         Ok(_) => {}

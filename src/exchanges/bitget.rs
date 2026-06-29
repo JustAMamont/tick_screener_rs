@@ -4,8 +4,8 @@ use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::tungstenite::Message;
 use std::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 pub struct BitgetConnector {
@@ -40,14 +40,15 @@ impl BitgetConnector {
     }
 
     fn parse_bitget_symbol(raw: &str) -> Option<(String, String)> {
-        // Bitget uses BTCUSDT or BTCUSDT_SPT (spot) / BTCUSDT_UMCBL (perp)
+        // Bitget использует формат символов без разделителей:
+        // BTCUSDT, ETHUSDT - для спота и LTCUSDT_SPT, BTCUSDT_UMCBL - для фьючерсов.
         let clean = raw.split('_').next().unwrap_or(raw);
         let quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH"];
         for q in quotes {
-            if let Some(base) = clean.strip_suffix(q) {
-                if !base.is_empty() {
-                    return Some((base.to_string(), q.to_string()));
-                }
+            if let Some(base) = clean.strip_suffix(q)
+                && !base.is_empty()
+            {
+                return Some((base.to_string(), q.to_string()));
             }
         }
         None
@@ -101,11 +102,10 @@ impl ExchangeConnector for BitgetConnector {
                     return None;
                 }
                 let (base, quote) = BitgetConnector::parse_bitget_symbol(&m.symbol)?;
-                let unified = format!("{}/{}", base, quote);
                 let unified = if self.market_type == MarketType::Perp {
-                    format!("{}:{}", unified, quote)
+                    format!("{}/{}.P", base, quote)
                 } else {
-                    unified
+                    format!("{}/{}", base, quote)
                 };
 
                 Some(MarketInfo {
@@ -119,7 +119,11 @@ impl ExchangeConnector for BitgetConnector {
             })
             .collect();
 
-        info!("Bitget {} loaded {} markets", self.market_type, markets.len());
+        info!(
+            "Bitget {} loaded {} markets",
+            self.market_type,
+            markets.len()
+        );
         Ok(markets)
     }
 
@@ -137,7 +141,7 @@ impl ExchangeConnector for BitgetConnector {
         let args: Vec<serde_json::Value> = symbols
             .iter()
             .filter_map(|s| {
-                let without_settle = s.split(':').next()?;
+                let without_settle = s.strip_suffix(".P").unwrap_or(s);
                 let (base, quote) = without_settle.split_once('/')?;
                 Some(serde_json::json!({
                     "instType": inst_type,
@@ -166,7 +170,8 @@ impl ExchangeConnector for BitgetConnector {
                         _ = tokio::time::sleep(retry_delay) => {},
                         _ = cancel.cancelled() => break Ok(()),
                     }
-                    let jitter = std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
+                    let jitter =
+                        std::time::Duration::from_millis(crate::exchanges::rand_int() % 1000);
                     retry_delay = (retry_delay * 2 + jitter).min(max_retry_delay);
                 }
             }
@@ -174,7 +179,7 @@ impl ExchangeConnector for BitgetConnector {
     }
 
     fn to_native_symbol(&self, unified: &str) -> String {
-        let without_settle = unified.split(':').next().unwrap_or(unified);
+        let without_settle = unified.strip_suffix(".P").unwrap_or(unified);
         if let Some((base, quote)) = without_settle.split_once('/') {
             format!("{}{}", base, quote)
         } else {
@@ -184,13 +189,12 @@ impl ExchangeConnector for BitgetConnector {
 
     fn to_unified_symbol(&self, native: &str) -> Option<String> {
         let (base, quote) = BitgetConnector::parse_bitget_symbol(native)?;
-        let unified = format!("{}/{}", base, quote);
-        let unified = if self.market_type == MarketType::Perp {
-            format!("{}:{}", unified, quote)
+        let suffix = if self.market_type == MarketType::Perp {
+            ".P"
         } else {
-            unified
+            ""
         };
-        Some(unified)
+        Some(format!("{}/{}{}", base, quote, suffix))
     }
 
     fn max_subscribe_args(&self) -> usize {
@@ -208,25 +212,29 @@ impl BitgetConnector {
         tx: &tokio::sync::broadcast::Sender<NormalizedTrade>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&self.ws_base, None, true).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        // Bitget: total payload per subscribe cannot exceed 4096 bytes.
-        // Chunk args into smaller batches and send multiple subscribe messages.
+        // Bitget: сообщение SUBSCRIBE не должно превышать 4096 байт. Разбиваем на чанки и отправляем несколько сообщений.
         const MAX_ARGS_PER_MSG: usize = 50; // 4096 / ~70 bytes per arg ≈ 58, use 50 for safety
         for chunk in args.chunks(MAX_ARGS_PER_MSG) {
             let subscribe_msg = serde_json::json!({
                 "op": "subscribe",
                 "args": chunk
             });
-            write.send(Message::Text(subscribe_msg.to_string().into())).await?;
+            write
+                .send(Message::Text(subscribe_msg.to_string().into()))
+                .await?;
         }
         info!(
             "Bitget {} WS subscribed: {} topics",
-            self.market_type, args.len()
+            self.market_type,
+            args.len()
         );
 
-        // Bitget requires pong on "ping" text messages; also send proactive "ping" every 20s
+        // Bitget требует ответа "pong" на сообщения с текстом "ping", 
+        // а также отправки сообщения «ping» каждые 20 секунд.
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
 
         let connected_since = Instant::now();
@@ -278,7 +286,7 @@ impl BitgetConnector {
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
         if v.get("event").is_some() {
-            return None; // Subscription confirmation
+            return None; // Подтверждение подписки
         }
 
         let data = v.get("data").and_then(|d| d.as_array())?;
@@ -290,11 +298,12 @@ impl BitgetConnector {
 
         let mut trades = Vec::with_capacity(data.len());
         for item in data {
-            // Bitget V2: "price"/"size"/"ts" (all strings)
+            // Bitget V2: "price"/"size"/"ts" (всё строки)
             let price: f64 = item.get("price")?.as_str()?.parse().ok()?;
             let size: f64 = item.get("size")?.as_str()?.parse().ok()?;
-            // Bitget sends ts as a string, e.g. "ts": "1670608600000"
-            let ts: i64 = item.get("ts")
+            // Bitget шлёт таймстемпы как строки, например "ts": "1670608600000"
+            let ts: i64 = item
+                .get("ts")
                 .and_then(|t| t.as_str().and_then(|s| s.parse().ok()))
                 .or_else(|| item.get("ts").and_then(|t| t.as_i64()))?;
 
@@ -307,6 +316,10 @@ impl BitgetConnector {
             });
         }
 
-        if trades.is_empty() { None } else { Some(trades) }
+        if trades.is_empty() {
+            None
+        } else {
+            Some(trades)
+        }
     }
 }

@@ -1,38 +1,54 @@
-/// Unified trade data from any exchange. This is the common data type
-/// that flows through the entire pipeline.
+//! Нормализованные типы данных, единые для всех бирж.
+//!
+//! Все коннекторы преобразуют свои биржа-специфичные структуры в
+//! эти типы, что позволяет остальным компонентам приложения работать
+//! агностически к конкретной бирже.
+
+/// Нормализованный трейд из любой биржи. Общий тип данных, который
+/// протекает через весь конвейер обработки.
 #[derive(Debug, Clone)]
 pub struct NormalizedTrade {
-    /// Unified symbol: "BTC/USDT" for spot, "BTC/USDT:USDT" for perp
+    /// Unified-символ: `"BTC/USDT"` для spot, `"BTC/USDT.P"` для perp.
     pub symbol: String,
-    /// Trade timestamp in milliseconds
+    /// Метка времени сделки в миллисекундах.
     pub timestamp_ms: i64,
-    /// Trade price
+    /// Цена сделки.
     pub price: f64,
-    /// Trade cost = price * amount (volume in quote currency)
+    /// Объём сделки в котируемой валюте (`price * amount`).
     pub cost: f64,
-    /// Which exchange this trade came from
+    /// Биржа-источник сделки.
     pub exchange: Exchange,
 }
 
-/// Supported exchanges
+/// Поддерживаемые биржи.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum Exchange {
+    /// Binance (spot + perp).
     Binance,
+    /// Bybit (spot + perp).
     Bybit,
+    /// Kucoin (spot + perp).
     Kucoin,
+    /// Bitget (spot + perp).
     Bitget,
+    /// Gate (spot + perp).
     Gate,
+    /// MEXC (spot + perp).
     Mexc,
 }
 
 impl Exchange {
-    /// Parse exchange name from scan config key (e.g., "bybit_spot" -> Bybit)
+    /// Разбирает имя биржи из ключа scan-конфига (например, `"bybit_spot"` -> `Exchange::Bybit`).
+    ///
+    /// # Возвращаемое значение
+    /// `Some(variant)` если префикс имени совпал с одной из поддерживаемых бирж,
+    /// иначе `None`. Сопоставление префиксов регистронезависимое.
     pub fn from_scan_name(name: &str) -> Option<Self> {
         let lower = name.to_lowercase();
         if lower.starts_with("binance") {
             Some(Exchange::Binance)
         } else if lower.starts_with("bybit") {
-            Some(Exchange::Binance)
+            Some(Exchange::Bybit)
         } else if lower.starts_with("kucoin") {
             Some(Exchange::Kucoin)
         } else if lower.starts_with("bitget") {
@@ -46,6 +62,7 @@ impl Exchange {
         }
     }
 
+    /// Строковое представление биржи (используется в логах и алертах).
     pub fn as_str(&self) -> &'static str {
         match self {
             Exchange::Binance => "binance",
@@ -64,13 +81,107 @@ impl std::fmt::Display for Exchange {
     }
 }
 
-/// Market info returned by load_markets
+/// Информация о рынке, возвращаемая `load_markets`.
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
-    pub symbol: String,      // unified: "BTC/USDT"
-    pub base: String,        // "BTC"
-    pub quote: String,       // "USDT"
+    /// Unified-символ: `"BTC/USDT"` для spot, `"BTC/USDT.P"` для perp.
+    pub symbol: String,
+    /// Базовая валюта: `"BTC"`.
+    pub base: String,
+    /// Котируемая валюта: `"USDT"`.
+    pub quote: String,
+    /// Активен ли рынок для торговли.
     pub active: bool,
+    /// Тип рынка (spot/perp).
     pub market_type: crate::config::MarketType,
-    pub raw_symbol: String,  // exchange-native: "BTCUSDT"
+    /// Native-символ биржи: `"BTCUSDT"`.
+    pub raw_symbol: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_scan_name_binance() {
+        assert_eq!(
+            Exchange::from_scan_name("binance_spot"),
+            Some(Exchange::Binance)
+        );
+        assert_eq!(
+            Exchange::from_scan_name("binance_perp"),
+            Some(Exchange::Binance)
+        );
+    }
+
+    #[test]
+    fn from_scan_name_bybit() {
+        // Регрессионный тест: ранее bybit ошибочно возвращал Binance
+        assert_eq!(
+            Exchange::from_scan_name("bybit_spot"),
+            Some(Exchange::Bybit)
+        );
+        assert_eq!(
+            Exchange::from_scan_name("bybit_perp"),
+            Some(Exchange::Bybit)
+        );
+    }
+
+    #[test]
+    fn from_scan_name_all_exchanges() {
+        assert_eq!(
+            Exchange::from_scan_name("kucoin_spot"),
+            Some(Exchange::Kucoin)
+        );
+        assert_eq!(
+            Exchange::from_scan_name("bitget_perp"),
+            Some(Exchange::Bitget)
+        );
+        assert_eq!(Exchange::from_scan_name("gate_spot"), Some(Exchange::Gate));
+        assert_eq!(Exchange::from_scan_name("mexc_fut"), Some(Exchange::Mexc));
+    }
+
+    #[test]
+    fn from_scan_name_case_insensitive() {
+        assert_eq!(
+            Exchange::from_scan_name("BYBIT_SPOT"),
+            Some(Exchange::Bybit)
+        );
+        assert_eq!(
+            Exchange::from_scan_name("Binance_Perp"),
+            Some(Exchange::Binance)
+        );
+    }
+
+    #[test]
+    fn from_scan_name_unknown_returns_none() {
+        assert!(Exchange::from_scan_name("unknown_exchange").is_none());
+        assert!(Exchange::from_scan_name("").is_none());
+    }
+
+    #[test]
+    fn as_str_returns_lowercase_name() {
+        assert_eq!(Exchange::Binance.as_str(), "binance");
+        assert_eq!(Exchange::Bybit.as_str(), "bybit");
+        assert_eq!(Exchange::Kucoin.as_str(), "kucoin");
+        assert_eq!(Exchange::Bitget.as_str(), "bitget");
+        assert_eq!(Exchange::Gate.as_str(), "gate");
+        assert_eq!(Exchange::Mexc.as_str(), "mexc");
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        assert_eq!(format!("{}", Exchange::Binance), "binance");
+        assert_eq!(format!("{}", Exchange::Bybit), "bybit");
+    }
+
+    #[test]
+    fn exchange_eq_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Exchange::Bybit);
+        set.insert(Exchange::Bybit);
+        set.insert(Exchange::Binance);
+        assert_eq!(set.len(), 2);
+    }
 }

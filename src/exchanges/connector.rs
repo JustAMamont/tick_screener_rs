@@ -1,27 +1,44 @@
+//! Трейт `ExchangeConnector` - общий интерфейс коннекторов к биржам.
+
 use crate::config::MarketType;
 use crate::exchanges::normalized::{Exchange, MarketInfo, NormalizedTrade};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-/// Factory function type for creating exchange connectors
+/// Тип фабричной функции для создания коннекторов бирж.
 pub type ConnectorFactory = fn(MarketType) -> Box<dyn ExchangeConnector>;
 
-/// Trait that all exchange WebSocket connectors must implement.
+/// Трейт, который должен реализовать каждый коннектор к бирже.
+///
+/// # Реализация
+///
+/// Все методы асинхронные (`async_trait`). Коннектор должен быть
+/// `Send + Sync` для использования из многопоточного tokio-рантайма.
+///
+/// # Жизненный цикл
+///
+/// 1. `new(market_type)` - создаёт коннектор.
+/// 2. `load_markets()` - один раз при подписке для получения списка пар.
+/// 3. `stream_trades()` - запускается для каждого батча символов,
+///    работает до отмены или фатальной ошибки.
 #[async_trait]
 pub trait ExchangeConnector: Send + Sync {
-    /// The exchange this connector handles
+    /// Биржа, обслуживаемая этим коннектором.
     fn exchange(&self) -> Exchange;
 
-    /// The market type (spot or perp)
+    /// Тип рынка (spot/perp).
     fn market_type(&self) -> MarketType;
 
-    /// Load all available markets via REST API.
-    /// Returns a list of market info that can be filtered by quote, type, etc.
+    /// Загружает все доступные рынки через REST API.
+    ///
+    /// Возвращает список [`MarketInfo`] для дальнейшей фильтрации
+    /// по котировке, типу и т.д.
     async fn load_markets(&self) -> anyhow::Result<Vec<MarketInfo>>;
 
-    /// Connect to WebSocket and stream normalized trades.
-    /// Sends trades through the broadcast channel.
-    /// Runs until cancelled or an unrecoverable error occurs.
+    /// Подключается к WebSocket и стримит нормализованные трейды.
+    ///
+    /// Отправляет трейды через broadcast-канал. Работает до отмены
+    /// через `cancel` или возникновения фатальной ошибки.
     async fn stream_trades(
         &self,
         symbols: Vec<String>,
@@ -29,18 +46,18 @@ pub trait ExchangeConnector: Send + Sync {
         cancel: CancellationToken,
     ) -> anyhow::Result<()>;
 
-    /// Format a unified symbol (e.g., "BTC/USDT") into exchange-native format (e.g., "BTCUSDT")
+    /// Преобразует unified-символ (`BTC/USDT`) в native-формат биржи (`BTCUSDT`).
     fn to_native_symbol(&self, unified: &str) -> String;
 
-    /// Parse an exchange-native symbol back to unified format
+    /// Преобразует native-символ биржи обратно в unified-формат.
     fn to_unified_symbol(&self, native: &str) -> Option<String>;
 
-    /// Maximum args allowed in a single WebSocket subscribe message.
-    /// Returns 0 if no known limit (effectively unlimited).
+    /// Максимальное количество аргументов в одном WebSocket SUBSCRIBE.
+    /// `0` = без лимита (например, Bybit perp).
     fn max_subscribe_args(&self) -> usize;
 }
 
-/// Get a connector factory for a given exchange
+/// Возвращает фабрику коннекторов для заданной биржи.
 pub fn get_connector_factory(exchange: Exchange) -> ConnectorFactory {
     match exchange {
         Exchange::Binance => |mt| Box::new(crate::exchanges::binance::BinanceConnector::new(mt)),
@@ -49,5 +66,32 @@ pub fn get_connector_factory(exchange: Exchange) -> ConnectorFactory {
         Exchange::Bitget => |mt| Box::new(crate::exchanges::bitget::BitgetConnector::new(mt)),
         Exchange::Gate => |mt| Box::new(crate::exchanges::gate::GateConnector::new(mt)),
         Exchange::Mexc => |mt| Box::new(crate::exchanges::mexc::MexcConnector::new(mt)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_connector_factory_returns_for_each_exchange() {
+        // Просто проверяем что фабрика не паникует для каждой биржи.
+        let _ = get_connector_factory(Exchange::Binance)(MarketType::Spot);
+        let _ = get_connector_factory(Exchange::Bybit)(MarketType::Perp);
+        let _ = get_connector_factory(Exchange::Kucoin)(MarketType::Spot);
+        let _ = get_connector_factory(Exchange::Bitget)(MarketType::Perp);
+        let _ = get_connector_factory(Exchange::Gate)(MarketType::Spot);
+        let _ = get_connector_factory(Exchange::Mexc)(MarketType::Perp);
+    }
+
+    #[test]
+    fn connector_factory_returns_correct_exchange() {
+        let c = get_connector_factory(Exchange::Binance)(MarketType::Spot);
+        assert_eq!(c.exchange(), Exchange::Binance);
+        assert_eq!(c.market_type(), MarketType::Spot);
+
+        let c = get_connector_factory(Exchange::Bybit)(MarketType::Perp);
+        assert_eq!(c.exchange(), Exchange::Bybit);
+        assert_eq!(c.market_type(), MarketType::Perp);
     }
 }
